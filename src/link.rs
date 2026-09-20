@@ -68,8 +68,10 @@ impl Links {
         true
     }
 
-    /// Whether a live link to this peer already exists.
-    fn connected(&self, peer: &str) -> bool {
+    /// Whether a live link to this peer already exists. The session asks before
+    /// letting its capture take the cursor: grabbing it with nowhere to send it
+    /// swallows the keyboard and mouse and leaves no way to reach the menu bar.
+    pub fn connected(&self, peer: &str) -> bool {
         self.peers.lock().unwrap().get(peer).is_some_and(|tx| !tx.is_closed())
     }
 
@@ -268,6 +270,7 @@ pub async fn run(
     links: Arc<Links>,
     status: Arc<Status>,
     to_session: UnboundedSender<(String, Msg)>,
+    link_state: UnboundedSender<(String, bool)>,
 ) -> Result<()> {
     let endpoint = endpoint(&config, &identity)?;
     info!(listen = %config.listen, name = %config.name, role = ?config.role, "glide up");
@@ -281,12 +284,13 @@ pub async fn run(
             links.clone(),
             status.clone(),
             to_session.clone(),
+            link_state.clone(),
         ));
     }
 
     while let Some(incoming) = endpoint.accept().await {
         let (peers, links, to_session) = (config.peers.clone(), links.clone(), to_session.clone());
-        let status = status.clone();
+        let (status, link_state) = (status.clone(), link_state.clone());
         tokio::spawn(async move {
             let conn = match incoming.await {
                 Ok(conn) => conn,
@@ -298,7 +302,7 @@ pub async fn run(
                 return warn!(addr = %conn.remote_address(), "connected peer is not in the config");
             };
             info!(peer = %name, addr = %conn.remote_address(), "peer connected");
-            if let Err(e) = serve(conn, &name, false, &links, &status, &to_session).await {
+            if let Err(e) = serve(conn, &name, false, &links, &status, &to_session, &link_state).await {
                 warn!(peer = %name, "link closed: {e}");
             }
         });
@@ -322,6 +326,7 @@ async fn dial_forever(
     links: Arc<Links>,
     status: Arc<Status>,
     to_session: UnboundedSender<(String, Msg)>,
+    link_state: UnboundedSender<(String, bool)>,
 ) {
     // Say why once, loudly: an unreachable peer is usually a firewall or a
     // missing Local Network permission, and silence there is hard to debug.
@@ -337,7 +342,9 @@ async fn dial_forever(
             Ok(conn) => {
                 info!(peer = %peer.name, addr = %conn.remote_address(), "connected");
                 complained = false;
-                if let Err(e) = serve(conn, &peer.name, true, &links, &status, &to_session).await {
+                if let Err(e) =
+                    serve(conn, &peer.name, true, &links, &status, &to_session, &link_state).await
+                {
                     warn!(peer = %peer.name, "link closed: {e}");
                 }
             }
@@ -372,6 +379,7 @@ async fn serve(
     links: &Links,
     status: &Status,
     to_session: &UnboundedSender<(String, Msg)>,
+    link_state: &UnboundedSender<(String, bool)>,
 ) -> Result<()> {
     // open_bi only reaches the peer once something is written, so the dialer
     // sends an empty frame to get the stream accepted on the other side.
@@ -389,6 +397,10 @@ async fn serve(
         debug!(%peer, "already linked, dropping the duplicate connection");
         return Ok(());
     }
+
+    // The session arms its screen edge on this and drops it again below. An
+    // edge armed with no link behind it grabs the cursor and sends it nowhere.
+    let _ = link_state.send((peer.to_string(), true));
 
     let started = Instant::now();
     let writer = tokio::spawn(write_loop(conn.clone(), send, rx));
@@ -416,6 +428,7 @@ async fn serve(
 
     status.offline(peer);
     links.unregister(peer);
+    let _ = link_state.send((peer.to_string(), false));
     pinger.abort();
     writer.abort();
     // Whoever had the cursor, they no longer do; let the session put input back
@@ -719,21 +732,28 @@ mod tests {
         let links = Arc::new(Links::default());
         let (to_session, mut inbox) = unbounded_channel();
         let (unused, _drop) = unbounded_channel();
-        let status = Arc::new(Status::default());
+        let (linked, mut link_state) = unbounded_channel();
+        let status = Arc::new(Status::at(dir.join("status")));
 
+        // Both connections are built here rather than inside the tasks, so the
+        // test keeps a handle it can close: aborting a `serve` leaves the
+        // writer and pinger it spawned holding the connection open.
+        let (accepted, dialed) = tokio::join!(
+            async { receiver.accept().await.unwrap().await.unwrap() },
+            async { sender.connect(addr, "glide").unwrap().await.unwrap() },
+        );
+        let hang_up = dialed.clone();
         let accepting = tokio::spawn({
-            let (links, status) = (links.clone(), status.clone());
+            let (links, status, linked) = (links.clone(), status.clone(), linked.clone());
             async move {
-                let conn = receiver.accept().await.unwrap().await.unwrap();
-                let _ = serve(conn, "peer", false, &links, &status, &to_session).await;
+                let _ = serve(accepted, "peer", false, &links, &status, &to_session, &linked).await;
             }
         });
         let out = Arc::new(Links::default());
         let dialing = tokio::spawn({
-            let (out, status) = (out.clone(), status.clone());
+            let (out, status, linked) = (out.clone(), status.clone(), linked.clone());
             async move {
-                let conn = sender.connect(addr, "glide").unwrap().await.unwrap();
-                let _ = serve(conn, "peer", true, &out, &status, &unused).await;
+                let _ = serve(dialed, "peer", true, &out, &status, &unused, &linked).await;
             }
         });
         while !out.connected("peer") {
@@ -771,6 +791,16 @@ mod tests {
         };
         tokio::time::timeout(Duration::from_secs(20), collect).await.expect("timed out");
         assert_eq!(clip, Some(image), "the clipboard arrived changed");
+
+        // The session arms its screen edge on the first of these and drops it
+        // again on the second. Without the second, an edge outlives the link
+        // that justified it and starts grabbing the cursor for nobody.
+        assert_eq!(link_state.recv().await, Some(("peer".to_string(), true)));
+        hang_up.close(0u32.into(), b"test over");
+        let down = async {
+            while link_state.recv().await != Some(("peer".to_string(), false)) {}
+        };
+        tokio::time::timeout(Duration::from_secs(20), down).await.expect("no link-down signal");
 
         accepting.abort();
         dialing.abort();

@@ -96,8 +96,8 @@ pub struct Config {
 
 /// Input flows one way, as it does in Barrier: the machine with the keyboard
 /// and mouse is the server, and the machine it drives is the client. Nothing
-/// arms a screen edge on a client and nothing types on a server, so neither
-/// end can take control of the other by surprise.
+/// types on a server, and a client's own screen edge only ever hands control
+/// back, so neither end can take the other over by surprise.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
@@ -197,6 +197,9 @@ fn daemon(
     tokio::task::LocalSet::new().block_on(&runtime, async move {
         let links = Arc::new(link::Links::default());
         let (to_session, from_links) = tokio::sync::mpsc::unbounded_channel();
+        // Whether each peer is reachable, so the session only arms a screen
+        // edge when there is a live link behind it.
+        let (link_up, link_state) = tokio::sync::mpsc::unbounded_channel();
         let peers = config.peers.iter().map(|p| p.name.clone()).collect();
         tokio::spawn(clipboard::watch(links.clone(), peers));
         let network = tokio::spawn(link::run(
@@ -205,9 +208,10 @@ fn daemon(
             links.clone(),
             status.clone(),
             to_session,
+            link_up,
         ));
         tokio::select! {
-            result = input::session(config, config_path, links, status, from_links, control) => result,
+            result = input::session(config, config_path, links, status, from_links, link_state, control) => result,
             result = network => result?,
             _ = tokio::signal::ctrl_c() => Ok(()),
         }

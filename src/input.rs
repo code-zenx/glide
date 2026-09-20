@@ -2,9 +2,14 @@
 //!
 //! Input flows one way. The **server** is the machine whose keyboard and mouse
 //! are shared: it watches its own screen edges, and when the cursor leaves one
-//! it starts sending. The **client** only types what arrives. A client arms no
-//! edge and a server builds no emulation backend, so neither machine can be
-//! driven by the other except in the one direction the config asks for.
+//! it starts sending. The **client** only types what arrives, and builds no
+//! capture of its own to send from.
+//!
+//! A client does arm one screen edge, but only to hand control back. Crossing
+//! it sends a single `Leave` and nothing else — no key, no motion — because
+//! otherwise there is no way back: the server's capture holds the cursor until
+//! something tells it to let go, and a client that shares no input has nothing
+//! else to say.
 
 use std::sync::Arc;
 
@@ -31,6 +36,10 @@ const RELEASE_CHORD: [Key; 4] = [
     Key::KeyLeftMeta,
 ];
 
+/// The chord spelled out, logged the moment the cursor leaves — the one time
+/// someone might need it is the one time they cannot look it up.
+const RELEASE_HINT: &str = "Ctrl+Shift+Alt+Cmd together";
+
 impl From<Side> for Position {
     fn from(side: Side) -> Self {
         match side {
@@ -51,6 +60,27 @@ enum Mode {
     Sending(CaptureHandle),
     /// The peer at this handle has the cursor and we type what it sends.
     Receiving(CaptureHandle),
+}
+
+/// What crossing an armed edge means. Decided apart from the backends, because
+/// getting it wrong strands the cursor and the keyboard with it.
+#[derive(PartialEq, Debug)]
+enum Crossing {
+    /// Take the cursor and start feeding the peer.
+    Send,
+    /// Give the cursor back to the server. All a client's edge ever means.
+    HandBack,
+    /// Let go. Holding the cursor with nowhere to send it swallows every key
+    /// and leaves no way to reach the menu bar and quit.
+    Stay,
+}
+
+fn crossing(server: bool, linked: bool) -> Crossing {
+    match (server, linked) {
+        (false, _) => Crossing::HandBack,
+        (true, true) => Crossing::Send,
+        (true, false) => Crossing::Stay,
+    }
 }
 
 /// What has to be undone when control moves away from us.
@@ -163,28 +193,26 @@ pub async fn session(
     links: Arc<Links>,
     status: Arc<Status>,
     mut from_links: UnboundedReceiver<(String, Msg)>,
+    mut link_state: UnboundedReceiver<(String, bool)>,
     mut control: UnboundedReceiver<Control>,
 ) -> Result<()> {
     let names: Vec<String> = config.peers.iter().map(|p| p.name.clone()).collect();
     let server = config.role == Role::Server;
 
-    // Only the end that needs a backend builds one, so a client never grabs a
-    // screen edge and a server can never be typed on from the wire.
-    let mut capture = if server { open_capture().await } else { None };
+    // Both ends watch an edge — the server to take the cursor, the client to
+    // give it back — but only a client can be typed on from the wire.
+    let mut capture = open_capture().await;
     let mut emulation = if server { None } else { open_emulation().await };
-    let mut degraded = if server { capture.is_none() } else { emulation.is_none() };
+    let mut degraded = capture.is_none() || (!server && emulation.is_none());
     status.allowed(!degraded);
 
-    for (i, peer) in config.peers.iter().enumerate() {
-        let handle = i as CaptureHandle;
-        if let Some(capture) = capture.as_mut() {
-            // A display numbered for people is 1-based; the backend counts from 0.
-            capture.restrict_to_display(peer.display.map(|d| d.saturating_sub(1))).await;
-            capture.create(handle, peer.position.into()).await?;
-            info!(peer = %peer.name, side = ?peer.position, display = ?peer.display, "screen edge armed");
-        }
+    // Edges are armed when the link comes up, not now. An edge with no link
+    // behind it grabs the cursor and feeds it to nobody, and with the peer
+    // above this screen that is every trip to the menu bar.
+    let mut armed = vec![false; config.peers.len()];
+    for i in 0..config.peers.len() {
         if let Some(emulation) = emulation.as_mut() {
-            emulation.create(handle).await;
+            emulation.create(i as CaptureHandle).await;
         }
     }
 
@@ -207,19 +235,33 @@ pub async fn session(
                 Some(Ok((handle, event))) => {
                     let Some(peer) = names.get(handle as usize) else { continue };
                     match event {
-                        CaptureEvent::Begin => {
-                            info!(%peer, "cursor left this screen");
-                            handover.began(handle);
-                            links.send(peer, Msg::Enter);
-                            push_clipboard(&links, peer);
-                        }
+                        CaptureEvent::Begin => match crossing(server, links.connected(peer)) {
+                            // Says "you have it back" and nothing else: no key
+                            // and no motion ever crosses this way.
+                            Crossing::HandBack => {
+                                info!(%peer, "cursor reached this edge, handing control back");
+                                links.send(peer, Msg::Leave);
+                                release(capture.as_mut()).await?;
+                            }
+                            Crossing::Stay => {
+                                warn!(%peer, "cursor left this screen but the peer is not connected, keeping input here");
+                                release(capture.as_mut()).await?;
+                            }
+                            Crossing::Send => {
+                                info!(%peer, "cursor left this screen; {RELEASE_HINT} takes it back");
+                                handover.began(handle);
+                                links.send(peer, Msg::Enter);
+                                push_clipboard(&links, peer);
+                            }
+                        },
                         CaptureEvent::Input(event) => {
-                            if handover.forwarding(handle) {
+                            if server && handover.forwarding(handle) {
                                 links.send(peer, Msg::Input(event));
                             }
                         }
                     }
-                    let chord = capture.as_ref().is_some_and(|c| c.keys_pressed(&RELEASE_CHORD));
+                    let chord =
+                        server && capture.as_ref().is_some_and(|c| c.keys_pressed(&RELEASE_CHORD));
                     if chord {
                         info!("release chord pressed, taking input back");
                         // The peer saw these keys go down but will never see
@@ -244,15 +286,38 @@ pub async fn session(
                     break;
                 }
             },
+            change = link_state.recv() => {
+                let Some((peer, up)) = change else { break };
+                let Some(handle) = names.iter().position(|n| *n == peer) else { continue };
+                let Some(capture) = capture.as_mut() else { continue };
+                if up == armed[handle] {
+                    continue;
+                }
+                armed[handle] = up;
+                let at = &config.peers[handle];
+                if up {
+                    // A display numbered for people is 1-based; the backend counts from 0.
+                    capture.restrict_to_display(at.display.map(|d| d.saturating_sub(1))).await;
+                    capture.create(handle as CaptureHandle, at.position.into()).await?;
+                    let purpose = if server { "to send from" } else { "to hand control back" };
+                    info!(%peer, side = ?at.position, display = ?at.display, "screen edge armed {purpose}");
+                } else {
+                    capture.destroy(handle as CaptureHandle).await?;
+                    info!(%peer, "link down, screen edge dropped");
+                }
+            },
             asked = control.recv() => {
                 let Some(asked) = asked else { break };
                 let Control::SetPosition(handle, side, on_display) = asked else {
                     // RetryBackends: permission may have just been granted, so
                     // build whichever backend this machine's role needs.
-                    if server && capture.is_none() {
+                    if capture.is_none() {
                         capture = open_capture().await;
                         if let Some(capture) = capture.as_mut() {
                             for (i, peer) in config.peers.iter().enumerate() {
+                                if !armed[i] {
+                                    continue;
+                                }
                                 capture
                                     .restrict_to_display(peer.display.map(|d| d.saturating_sub(1)))
                                     .await;
@@ -270,14 +335,14 @@ pub async fn session(
                             info!("input emulation is working now");
                         }
                     }
-                    degraded = if server { capture.is_none() } else { emulation.is_none() };
+                    degraded = capture.is_none() || (!server && emulation.is_none());
                     publish(&handover, degraded, &mut shown);
                     continue;
                 };
                 let Some(peer) = names.get(handle as usize) else { continue };
                 // Re-arm the edge: the capture backend keys a grab to a screen
                 // side, so moving the peer means dropping it and taking a new one.
-                if let Some(capture) = capture.as_mut() {
+                if let Some(capture) = capture.as_mut().filter(|_| armed[handle as usize]) {
                     capture.destroy(handle).await?;
                     capture.restrict_to_display(on_display.map(|d| d.saturating_sub(1))).await;
                     capture.create(handle, side.into()).await?;
@@ -337,7 +402,7 @@ pub async fn session(
                         if let Err(e) = crate::set_peer_side(&config_path, &peer, side) {
                             warn!(%peer, "cannot save the arrangement: {e}");
                         }
-                        if let Some(capture) = capture.as_mut() {
+                        if let Some(capture) = capture.as_mut().filter(|_| armed[handle as usize]) {
                             capture.destroy(handle).await?;
                             capture.create(handle, side.into()).await?;
                         }
@@ -466,6 +531,29 @@ mod tests {
         h.take_back();
         assert_eq!(h.name(), "local");
         assert!(!h.forwarding(0));
+    }
+
+    /// Crossing an edge must never strand the cursor. Two ways it used to:
+    /// a server with no peer grabbed it and forwarded into nothing, and a
+    /// client had no edge to hand it back with, so only the chord got it out.
+    #[test]
+    fn an_edge_never_traps_the_cursor() {
+        assert_eq!(crossing(true, true), Crossing::Send);
+        assert_eq!(
+            crossing(true, false),
+            Crossing::Stay,
+            "a server with nowhere to send must keep input on this machine"
+        );
+        assert_eq!(
+            crossing(false, true),
+            Crossing::HandBack,
+            "a client's edge is the way back, never a way to send"
+        );
+        assert_eq!(
+            crossing(false, false),
+            Crossing::HandBack,
+            "and it stays the way back even with the link down"
+        );
     }
 
     /// The whole point of the roles: a server's keyboard and mouse are shared

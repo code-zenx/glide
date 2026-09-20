@@ -3,7 +3,7 @@
 //! to the daemon or costing it a thread.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::Result;
@@ -149,21 +149,40 @@ pub fn read() -> State {
 
 /// The daemon's handle on that file. Writes only when something actually
 /// changed, so a quiet session touches the disk twice a minute at most.
-#[derive(Default)]
 pub struct Status {
     current: Mutex<State>,
     /// What each peer says it has attached, for the arrange window. Not
     /// written to the status file: it changes rarely and nothing else wants it.
     peer_screens: Mutex<HashMap<String, Vec<Screen>>>,
+    /// Where `set` writes. The default is the file everything else reads; a
+    /// test points it somewhere disposable so `cargo test` cannot clobber the
+    /// state of a daemon that happens to be running.
+    file: PathBuf,
+}
+
+impl Default for Status {
+    fn default() -> Self {
+        Self {
+            current: Mutex::default(),
+            peer_screens: Mutex::default(),
+            file: path(),
+        }
+    }
 }
 
 impl Status {
+    /// A status that writes somewhere harmless.
+    #[cfg(test)]
+    pub fn at(file: PathBuf) -> Self {
+        Self { file, ..Default::default() }
+    }
+
     pub fn set(&self, change: impl FnOnce(&mut State)) {
         let mut current = self.current.lock().unwrap();
         let before = current.clone();
         change(&mut current);
         if *current != before {
-            let _ = write(&current);
+            let _ = write(&self.file, &current);
         }
     }
 
@@ -197,13 +216,12 @@ impl Status {
     }
 }
 
-fn write(state: &State) -> Result<()> {
-    let path = path();
+fn write(path: &Path, state: &State) -> Result<()> {
     std::fs::create_dir_all(path.parent().unwrap())?;
     // Rename over the old file so a reader never sees half a line.
     let temp = path.with_extension("tmp");
     std::fs::write(&temp, state.encode())?;
-    std::fs::rename(&temp, &path)?;
+    std::fs::rename(&temp, path)?;
     Ok(())
 }
 
