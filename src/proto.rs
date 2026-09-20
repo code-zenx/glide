@@ -1,9 +1,11 @@
 //! What one machine says to another, and how it goes on the wire.
 //!
 //! Pointer motion and pings travel as QUIC datagrams: they are worthless once
-//! late, so a lost one is better dropped than retransmitted. Everything else —
-//! key presses, buttons, clipboard, who has the cursor — goes on a reliable
-//! stream, because a dropped key-up leaves a modifier stuck down on the peer.
+//! late, so a lost one is better dropped than retransmitted. Key presses,
+//! buttons and who has the cursor go on a reliable stream, because a dropped
+//! key-up leaves a modifier stuck down on the peer. The clipboard gets a
+//! stream to itself: it is the only message that can run to megabytes, and
+//! anything queued behind it would wait for all of them.
 
 use anyhow::{bail, Context, Result};
 use input_event::{Event, KeyboardEvent, PointerEvent};
@@ -34,13 +36,25 @@ pub enum Msg {
     Arrange(Side),
 }
 
+/// Which of the connection's three channels a message belongs on.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum Route {
+    /// Droppable and worthless once late.
+    Datagram,
+    /// Must arrive, and small enough that the next one is never held up.
+    Stream,
+    /// Must arrive, may be megabytes: gets a stream of its own.
+    Bulk,
+}
+
 impl Msg {
-    /// Whether this must arrive. Motion may be dropped; nothing else may.
-    pub fn reliable(&self) -> bool {
-        !matches!(
-            self,
-            Msg::Ping(_) | Msg::Pong(_) | Msg::Input(Event::Pointer(PointerEvent::Motion { .. }))
-        )
+    pub fn route(&self) -> Route {
+        match self {
+            Msg::Ping(_) | Msg::Pong(_) => Route::Datagram,
+            Msg::Input(Event::Pointer(PointerEvent::Motion { .. })) => Route::Datagram,
+            Msg::Clipboard(_) => Route::Bulk,
+            _ => Route::Stream,
+        }
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -262,12 +276,18 @@ mod tests {
     }
 
     #[test]
-    fn only_motion_and_pings_may_be_dropped() {
-        assert!(!Msg::Ping(1).reliable());
-        assert!(!Msg::Input(Event::Pointer(PointerEvent::Motion { time: 0, dx: 1.0, dy: 0.0 })).reliable());
-        assert!(Msg::Input(Event::Keyboard(KeyboardEvent::Key { time: 0, key: 1, state: 0 })).reliable());
-        assert!(Msg::Enter.reliable());
-        assert!(Msg::Clipboard(Clip::Text(String::new())).reliable());
+    fn every_message_goes_down_the_right_channel() {
+        let motion = Event::Pointer(PointerEvent::Motion { time: 0, dx: 1.0, dy: 0.0 });
+        assert_eq!(Msg::Ping(1).route(), Route::Datagram);
+        assert_eq!(Msg::Input(motion).route(), Route::Datagram);
+        let key = Event::Keyboard(KeyboardEvent::Key { time: 0, key: 1, state: 0 });
+        assert_eq!(Msg::Input(key).route(), Route::Stream);
+        assert_eq!(Msg::Enter.route(), Route::Stream);
+        assert_eq!(Msg::Arrange(Side::Left).route(), Route::Stream);
+        // Both kinds of clipboard, because text can be a megabyte too.
+        assert_eq!(Msg::Clipboard(Clip::Text(String::new())).route(), Route::Bulk);
+        let image = Clip::Image { mime: "image/png".into(), bytes: vec![0; 8] };
+        assert_eq!(Msg::Clipboard(image).route(), Route::Bulk);
     }
 
     #[test]

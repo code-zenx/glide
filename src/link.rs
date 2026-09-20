@@ -1,5 +1,14 @@
 //! The encrypted link between two machines: a QUIC connection whose peer is
 //! identified by a pinned certificate fingerprint, plus round-trip timing.
+//!
+//! Three channels share the connection, and keeping them apart is what keeps
+//! the cursor smooth:
+//!
+//! - **datagrams** for pointer motion and pings, worthless once late;
+//! - **one reliable stream** for keys, buttons and handover, all tiny;
+//! - **a stream of its own per clipboard item**, because a sixteen-megabyte
+//!   image sharing a lane with a key press delays the key press by the whole
+//!   image.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,10 +24,10 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tracing::{debug, info, warn};
 
-use crate::proto::Msg;
+use crate::proto::{Msg, Route};
 use crate::status::Status;
 use crate::{Config, Peer};
 
@@ -27,9 +36,11 @@ const PING_INTERVAL: Duration = Duration::from_secs(1);
 const STATS_INTERVAL: Duration = Duration::from_secs(10);
 /// Enough samples for a meaningful p99 without keeping history forever.
 const SAMPLE_WINDOW: usize = 200;
-/// Refuse absurd frames rather than allocating for them. A clipboard image is
-/// the largest thing that legitimately crosses, so this tracks its cap.
-const MAX_FRAME: usize = crate::clipboard::MAX_IMAGE + (1 << 16);
+/// The reliable stream carries a key event, a handover or a screen list and
+/// nothing else, so anything larger is a desynchronised stream, not a message.
+const MAX_FRAME: usize = 1 << 16;
+/// A clipboard item, which arrives on a stream of its own.
+const MAX_BULK: usize = crate::clipboard::MAX_IMAGE + (1 << 16);
 
 /// Every peer this machine can currently talk to, by name.
 #[derive(Default)]
@@ -259,7 +270,7 @@ pub async fn run(
     to_session: UnboundedSender<(String, Msg)>,
 ) -> Result<()> {
     let endpoint = endpoint(&config, &identity)?;
-    info!(listen = %config.listen, name = %config.name, "glide up");
+    info!(listen = %config.listen, name = %config.name, role = ?config.role, "glide up");
 
     // Both machines dial each other; whichever connection lands first is the
     // one that gets used. One end being firewalled costs nothing this way.
@@ -353,8 +364,7 @@ async fn dial(endpoint: &Endpoint, peer: &Peer) -> Result<Connection> {
     Err(last)
 }
 
-/// Run one connection: a reliable stream both ways, datagrams for motion and
-/// pings, and a running latency summary.
+/// Run one connection until it dies.
 async fn serve(
     conn: Connection,
     peer: &str,
@@ -374,30 +384,14 @@ async fn serve(
     };
     let _ = send.flush().await;
 
-    let (tx, mut rx) = unbounded_channel::<Msg>();
+    let (tx, rx) = unbounded_channel::<Msg>();
     if !links.try_register(peer, tx.clone()) {
         debug!(%peer, "already linked, dropping the duplicate connection");
         return Ok(());
     }
 
     let started = Instant::now();
-    let writer = tokio::spawn({
-        let conn = conn.clone();
-        async move {
-            while let Some(msg) = rx.recv().await {
-                let bytes = msg.encode();
-                let sent = if msg.reliable() {
-                    write_frame(&mut send, &bytes).await
-                } else {
-                    conn.send_datagram(Bytes::from(bytes)).map_err(Into::into)
-                };
-                if let Err(e) = sent {
-                    debug!("send failed: {e}");
-                    return;
-                }
-            }
-        }
-    });
+    let writer = tokio::spawn(write_loop(conn.clone(), send, rx));
     let pinger = tokio::spawn(ping_loop(tx.clone(), started));
     status.set(|s| {
         s.peer = peer.to_string();
@@ -409,10 +403,18 @@ async fn serve(
     // draw real screens instead of a placeholder.
     let _ = tx.send(Msg::Screens(crate::screens::local()));
 
-    let result = pump(&conn, recv, peer, started, &tx, status, to_session).await;
+    // Each reader runs its own loop, so a half-read frame is never abandoned
+    // part way: `RecvStream::read_exact` is not cancel-safe, and dropping it
+    // mid-frame swallows bytes and desynchronises the stream for good. The
+    // first one to fail ends the link, and cancelling the others then costs
+    // nothing because everything is being torn down anyway.
+    let result = tokio::select! {
+        result = frames(recv, peer, to_session) => result,
+        result = bulk(&conn, peer, to_session) => result,
+        result = datagrams(&conn, peer, started, &tx, status, to_session) => result,
+    };
 
     status.offline(peer);
-
     links.unregister(peer);
     pinger.abort();
     writer.abort();
@@ -422,10 +424,92 @@ async fn serve(
     result
 }
 
-/// Read both channels until the connection dies.
-async fn pump(
-    conn: &Connection,
+/// Put every outgoing message on the channel it belongs to. Clipboard items go
+/// out on streams of their own, spawned, so a large one never delays the key
+/// press queued behind it.
+async fn write_loop(conn: Connection, mut send: SendStream, mut rx: UnboundedReceiver<Msg>) {
+    while let Some(msg) = rx.recv().await {
+        let bytes = msg.encode();
+        let sent = match msg.route() {
+            Route::Bulk => {
+                send_bulk(conn.clone(), bytes);
+                Ok(())
+            }
+            Route::Datagram => conn.send_datagram(Bytes::from(bytes)).map_err(Into::into),
+            Route::Stream => write_frame(&mut send, &bytes).await,
+        };
+        if let Err(e) = sent {
+            debug!("send failed: {e}");
+            return;
+        }
+    }
+}
+
+/// One clipboard item, one stream. Dropping the handle after `finish` still
+/// sends what is buffered, so this task ends as soon as the bytes are handed
+/// to the connection.
+fn send_bulk(conn: Connection, bytes: Vec<u8>) {
+    tokio::spawn(async move {
+        match conn.open_uni().await {
+            Ok(mut stream) => {
+                if let Err(e) = stream.write_all(&bytes).await {
+                    debug!("clipboard send failed: {e}");
+                } else {
+                    let _ = stream.finish();
+                }
+            }
+            Err(e) => debug!("cannot open a clipboard stream: {e}"),
+        }
+    });
+}
+
+/// Keys, buttons and handover, length-prefixed on the one reliable stream.
+async fn frames(
     mut recv: RecvStream,
+    peer: &str,
+    to_session: &UnboundedSender<(String, Msg)>,
+) -> Result<()> {
+    loop {
+        let frame = read_frame(&mut recv).await?;
+        if frame.is_empty() {
+            continue; // the stream-opening frame
+        }
+        match Msg::decode(&frame) {
+            Ok(msg) => {
+                let _ = to_session.send((peer.to_string(), msg));
+            }
+            Err(e) => debug!(%peer, "bad frame: {e}"),
+        }
+    }
+}
+
+/// A clipboard item per stream: the stream ending is the length, so nothing
+/// has to be framed and nothing else waits on it.
+async fn bulk(
+    conn: &Connection,
+    peer: &str,
+    to_session: &UnboundedSender<(String, Msg)>,
+) -> Result<()> {
+    loop {
+        let mut recv = conn.accept_uni().await?;
+        let (peer, to_session) = (peer.to_string(), to_session.clone());
+        tokio::spawn(async move {
+            match recv.read_to_end(MAX_BULK).await {
+                Ok(bytes) => match Msg::decode(&bytes) {
+                    Ok(msg) => {
+                        let _ = to_session.send((peer, msg));
+                    }
+                    Err(e) => debug!(%peer, "bad clipboard message: {e}"),
+                },
+                Err(e) => debug!(%peer, "clipboard stream failed: {e}"),
+            }
+        });
+    }
+}
+
+/// Motion and pings, plus the running latency summary.
+async fn datagrams(
+    conn: &Connection,
     peer: &str,
     started: Instant,
     tx: &UnboundedSender<Msg>,
@@ -445,16 +529,6 @@ async fn pump(
                     Err(e) => debug!(%peer, "bad datagram: {e}"),
                 }
             }
-            frame = read_frame(&mut recv) => {
-                let frame = frame?;
-                if frame.is_empty() {
-                    continue; // the stream-opening frame
-                }
-                match Msg::decode(&frame) {
-                    Ok(msg) => { let _ = to_session.send((peer.to_string(), msg)); }
-                    Err(e) => debug!(%peer, "bad frame: {e}"),
-                }
-            }
             _ = report.tick() => {
                 if let Some(line) = samples.summary() {
                     info!(%peer, "{line}");
@@ -472,6 +546,8 @@ async fn write_frame(send: &mut SendStream, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Not cancel-safe: only ever awaited by [`frames`], which has nothing else to
+/// race it against.
 async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
     let mut len = [0u8; 4];
     recv.read_exact(&mut len).await?;
@@ -583,5 +659,122 @@ mod tests {
         links.unregister("anorak");
         links.send("anorak", Msg::Leave);
         assert!(rx.try_recv().is_err());
+    }
+
+    /// A clipboard image must never be able to claim the reliable stream, or a
+    /// key press waits behind sixteen megabytes.
+    #[test]
+    fn the_clipboard_never_shares_a_lane_with_input() {
+        use crate::clipboard::Clip;
+        use input_event::{Event, KeyboardEvent, PointerEvent};
+
+        let image = Msg::Clipboard(Clip::Image { mime: "image/png".into(), bytes: vec![0; 64] });
+        assert!(matches!(image.route(), Route::Bulk));
+        assert!(matches!(Msg::Clipboard(Clip::Text("hi".into())).route(), Route::Bulk));
+
+        let key = Msg::Input(Event::Keyboard(KeyboardEvent::Key { time: 0, key: 1, state: 1 }));
+        assert!(matches!(key.route(), Route::Stream));
+        assert!(matches!(Msg::Enter.route(), Route::Stream));
+
+        let motion = Msg::Input(Event::Pointer(PointerEvent::Motion { time: 0, dx: 1.0, dy: 0.0 }));
+        assert!(matches!(motion.route(), Route::Datagram));
+        assert!(matches!(Msg::Ping(0).route(), Route::Datagram));
+    }
+
+    /// The bug this whole split exists for. A clipboard image spans thousands
+    /// of packets, so while it was framed on the input stream every ping that
+    /// landed mid-frame cancelled a `read_exact` that had already swallowed
+    /// bytes, desynchronising the stream for the rest of the link — and until
+    /// it finished, every key press waited behind the whole image.
+    ///
+    /// Two real endpoints over loopback, because nothing smaller would have
+    /// caught it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_big_clipboard_item_neither_corrupts_nor_delays_input() -> Result<()> {
+        use crate::clipboard::Clip;
+        use crate::{Role, Side};
+        use input_event::{Event, KeyboardEvent};
+
+        const KEYS: u32 = 200;
+        let dir = std::env::temp_dir().join(format!("glide-link-{}", std::process::id()));
+        let (here, there) = (dir.join("here"), dir.join("there"));
+        let (id_here, id_there) = (Identity::load_or_create(&here)?, Identity::load_or_create(&there)?);
+
+        let config = |peer: &Identity, name: &str| Config {
+            name: name.to_string(),
+            role: Role::Server,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            peers: vec![Peer {
+                name: "peer".into(),
+                addrs: vec![],
+                fingerprint: peer.fingerprint(),
+                position: Side::Right,
+                display: None,
+            }],
+        };
+        let sender = endpoint(&config(&id_there, "here"), &id_here)?;
+        let receiver = endpoint(&config(&id_here, "there"), &id_there)?;
+        let addr = receiver.local_addr()?;
+
+        let links = Arc::new(Links::default());
+        let (to_session, mut inbox) = unbounded_channel();
+        let (unused, _drop) = unbounded_channel();
+        let status = Arc::new(Status::default());
+
+        let accepting = tokio::spawn({
+            let (links, status) = (links.clone(), status.clone());
+            async move {
+                let conn = receiver.accept().await.unwrap().await.unwrap();
+                let _ = serve(conn, "peer", false, &links, &status, &to_session).await;
+            }
+        });
+        let out = Arc::new(Links::default());
+        let dialing = tokio::spawn({
+            let (out, status) = (out.clone(), status.clone());
+            async move {
+                let conn = sender.connect(addr, "glide").unwrap().await.unwrap();
+                let _ = serve(conn, "peer", true, &out, &status, &unused).await;
+            }
+        });
+        while !out.connected("peer") {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Two megabytes of clipboard, then a burst of key presses right behind
+        // it — the order that used to wedge the link.
+        let bytes: Vec<u8> = (0..2_000_000u32).map(|i| i as u8).collect();
+        let image = Clip::Image { mime: "image/png".into(), bytes: bytes.clone() };
+        out.send("peer", Msg::Clipboard(image.clone()));
+        for time in 0..KEYS {
+            out.send("peer", Msg::Input(Event::Keyboard(KeyboardEvent::Key { time, key: 30, state: 1 })));
+        }
+
+        let (mut keys, mut clip) = (0u32, None);
+        let collect = async {
+            while keys < KEYS || clip.is_none() {
+                match inbox.recv().await.expect("link died").1 {
+                    Msg::Input(Event::Keyboard(KeyboardEvent::Key { time, .. })) => {
+                        assert_eq!(time, keys, "a key arrived out of order or was lost");
+                        keys += 1;
+                    }
+                    Msg::Clipboard(got) => {
+                        // The lanes are independent, so keys sent after the
+                        // image still overtake it. Sharing one stream put this
+                        // at exactly zero; how far past zero is a race between
+                        // two sockets and not worth pinning down.
+                        assert!(keys > 0, "every key queued behind the clipboard");
+                        clip = Some(got);
+                    }
+                    _ => {} // the screen list each side sends on connect
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(20), collect).await.expect("timed out");
+        assert_eq!(clip, Some(image), "the clipboard arrived changed");
+
+        accepting.abort();
+        dialing.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 }

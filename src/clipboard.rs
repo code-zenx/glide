@@ -210,8 +210,9 @@ fn write_image(mime: &str, bytes: Vec<u8>) {
     use wl_clipboard_rs::copy::{copy, MimeType, Options, Source};
 
     let mut options = Options::new();
-    // Serve the clipboard from this process rather than forking a helper that
-    // would outlive the daemon.
+    // Serve paste requests on a thread of this process, so `copy` returns at
+    // once. Blocking here instead would hold the thread until someone else
+    // copies something, and the thread dies with the daemon either way.
     options.foreground(false);
     if let Err(e) = copy(
         options,

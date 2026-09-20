@@ -1,13 +1,23 @@
+# The client end: starts with the Hyprland session and stays up.
+#
+#   cp contrib/glide.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#
+# systemd knows nothing about Wayland, so hyprland.conf has to hand it the
+# session's environment before starting this:
+#
+#   exec-once = systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR HYPRLAND_INSTANCE_SIGNATURE
+#   exec-once = systemctl --user start glide.service
+#
+# There is no [Install] section on purpose: graphical-session.target is never
+# reached under plain Hyprland, so an enabled unit would sit waiting forever.
+
 [Unit]
-Description=glide — shared keyboard and mouse
+Description=glide — driven by the server's keyboard and mouse
 PartOf=graphical-session.target
-After=graphical-session.target
 
 [Service]
-ExecStart=%h/projects/glide/target/release/glide run
+ExecStart=%h/.local/bin/glide run
 Restart=always
 RestartSec=2
 Environment=RUST_LOG=glide=info
-
-[Install]
-WantedBy=graphical-session.target

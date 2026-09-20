@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 #[derive(Parser)]
@@ -46,6 +46,10 @@ enum Cmd {
         /// Name of this machine, as peers refer to it
         #[arg(long)]
         name: String,
+        /// `server` if this machine's keyboard and mouse drive the other one,
+        /// `client` if it is the one being driven
+        #[arg(long)]
+        role: Role,
     },
     /// Print this machine's certificate fingerprint
     Fingerprint,
@@ -81,11 +85,26 @@ enum Cmd {
 pub struct Config {
     /// Name of this machine
     pub name: String,
+    /// Which end of the link this machine is
+    pub role: Role,
     /// Address to listen on
     #[serde(default = "default_listen")]
     pub listen: SocketAddr,
     #[serde(default, rename = "peer")]
     pub peers: Vec<Peer>,
+}
+
+/// Input flows one way, as it does in Barrier: the machine with the keyboard
+/// and mouse is the server, and the machine it drives is the client. Nothing
+/// arms a screen edge on a client and nothing types on a server, so neither
+/// end can take control of the other by surprise.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// This machine's keyboard and mouse are the ones being shared.
+    Server,
+    /// This machine is driven by the server, and shares no input of its own.
+    Client,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -196,9 +215,14 @@ fn daemon(
 }
 
 fn load(path: &Path) -> Result<Config> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("no config at {}, run `glide init --name <name>`", path.display()))?;
-    Ok(toml::from_str(&text)?)
+    let text = std::fs::read_to_string(path).with_context(|| {
+        format!("no config at {}, run `glide init --name <name> --role <server|client>`", path.display())
+    })?;
+    // `role` is the one field with no default: guessing it wrong would either
+    // hand the other machine control of this one or share nothing at all.
+    toml::from_str(&text).with_context(|| {
+        format!("{}: role is \"server\" to share this machine's keyboard and mouse, \"client\" to be driven", path.display())
+    })
 }
 
 /// The app has no terminal to print to, so it keeps a log where a person can
@@ -234,18 +258,23 @@ fn main() -> Result<()> {
     start_logging(false);
 
     match &cmd {
-        Cmd::Init { name } => {
+        Cmd::Init { name, role } => {
             if path.exists() {
                 bail!("{} already exists", path.display());
             }
             let identity = link::Identity::load_or_create(&config_dir())?;
-            let config = Config { name: name.clone(), listen: default_listen(), peers: vec![] };
+            let config =
+                Config { name: name.clone(), role: *role, listen: default_listen(), peers: vec![] };
             std::fs::create_dir_all(path.parent().unwrap())?;
             std::fs::write(&path, toml::to_string_pretty(&config)?)?;
             println!("wrote {}", path.display());
             println!("fingerprint: {}", identity.fingerprint());
             println!("\nAdd the other machine to that file:\n");
             println!("[[peer]]\nname = \"other\"\naddrs = [\"192.168.0.3:4242\"]\nposition = \"right\"\nfingerprint = \"<its fingerprint>\"");
+            if *role == Role::Client {
+                println!("\nThis machine is a client: it types what the server sends and shares");
+                println!("no keyboard or mouse of its own. `position` is only read on the server.");
+            }
         }
         Cmd::Fingerprint => {
             println!("{}", link::Identity::load_or_create(&config_dir())?.fingerprint());

@@ -1,27 +1,34 @@
 # glide
 
 Share one keyboard, mouse and clipboard between a Mac and a Linux box on the same
-network. Either machine can drive the other: push the cursor off the edge of one
-screen and it appears on the other, and the keyboard follows it. Copy text or an
-image on either machine and it is on the other's clipboard a second later.
+network. Push the cursor off the edge of the screen that owns the keyboard and it
+appears on the other machine, and the keyboard follows it. Copy text or an image
+on either machine and it is on the other's clipboard a second later.
+
+Input goes one way, the way Barrier does it. The **server** is the machine whose
+keyboard and mouse are being shared; the **client** is the machine it drives. A
+client arms no screen edge and a server builds no typing backend, so neither end
+can take the other over by accident.
 
 Tested between macOS (`goldengate`) and Arch with Hyprland (`anorak`), linked by
 Ethernet: round trip 2.4 ms.
 
 ## How it is built
 
-- **Transport** — QUIC (`quinn`). Pointer motion travels as unreliable datagrams, so
-  a lost packet never stalls the cursor; keys, buttons, clipboard and cursor
-  handover go on a reliable stream, so nothing gets stuck down.
+- **Transport** — QUIC (`quinn`), on three channels. Pointer motion travels as
+  unreliable datagrams, so a lost packet never stalls the cursor. Keys, buttons and
+  cursor handover share one small reliable stream, so nothing gets stuck down. Each
+  clipboard item gets a stream of its own, because a sixteen-megabyte image on the
+  input stream would delay every key queued behind it by the whole image.
 - **Trust** — each machine generates a self-signed certificate on first run and
   pins the other's fingerprint, checked in both directions. No CA, no password;
   nothing else on the network can connect or inject input.
 - **Input** — the `input-capture` and `input-emulation` crates from
   [lan-mouse](https://github.com/feschber/lan-mouse): layer-shell capture and
   wlroots emulation on Hyprland, native event taps on macOS.
-- **Handover** — both machines watch their own screen edges, so control simply
-  follows the cursor. Ctrl+Shift+Alt+Meta together yank input back if a peer
-  stops answering.
+- **Handover** — the server watches its own screen edges, so control follows the
+  cursor. Ctrl+Shift+Alt+Meta together yank input back if the client stops
+  answering.
 - **Addresses** — a peer may list several (Ethernet, Wi-Fi, Tailscale). Both ends
   dial; the first connection that lands is used and the duplicate hangs up, so one
   end being firewalled costs nothing.
@@ -47,8 +54,13 @@ bash contrib/bundle.sh          # builds and installs /Applications/Glide.app
 ### 2. Create a config, on each machine
 
 ```sh
-./target/release/glide init --name mymac      # any name you like
-./target/release/glide fingerprint            # note this down
+# on the machine with the keyboard and mouse
+./target/release/glide init --name mymac --role server
+
+# on the machine it drives
+./target/release/glide init --name mybox --role client
+
+./target/release/glide fingerprint            # note this down, on both
 ```
 
 ### 3. Tell each machine about the other
@@ -57,6 +69,7 @@ Edit `~/.config/glide/config.toml` on both. Each one lists the *other* machine:
 
 ```toml
 name = "mymac"                 # this machine
+role = "server"                # "client" on the machine being driven
 listen = "0.0.0.0:4242"
 
 [[peer]]
@@ -66,30 +79,44 @@ position = "right"             # where its screen sits: left, right, top, bottom
 fingerprint = "<the fingerprint printed on the other machine>"
 ```
 
-Set `position` to opposites — if the peer is `right` of this machine, this machine
-is `left` of the peer. Rearranging from the macOS app fixes the other end
-automatically.
+`position` is only read on the server — it is the edge the cursor leaves by.
+Rearranging from the macOS app tells the client about it too, so the two agree if
+the roles are ever swapped.
 
 ### 4. Run it
 
-**Linux:**
+**Linux (the client), started by the session:**
 
 ```sh
+install -Dm755 target/release/glide ~/.local/bin/glide
 cp contrib/glide.service ~/.config/systemd/user/
-systemctl --user enable --now glide
+systemctl --user daemon-reload
 ```
 
-Edit the unit first if you cloned somewhere other than `~/projects/glide`. Under
-Wayland it also needs `XDG_RUNTIME_DIR` and `WAYLAND_DISPLAY`, which the unit sets.
+systemd knows nothing about Wayland, so hand it the session's environment from
+`hyprland.conf` and start it from there:
 
-**macOS:** open Glide from Applications, then grant it two permissions in
-System Settings → Privacy & Security:
+```
+exec-once = systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR HYPRLAND_INSTANCE_SIGNATURE
+exec-once = systemctl --user start glide.service
+```
+
+Without that import the daemon starts with no `WAYLAND_DISPLAY` and can neither
+capture nor reach the clipboard. The unit has no `[Install]` section on purpose:
+plain Hyprland never reaches `graphical-session.target`, so an enabled unit would
+wait for it forever.
+
+**macOS (the server), started by you.** Open Glide from Applications, then grant
+it two permissions in System Settings → Privacy & Security:
 
 - **Input Monitoring** — add `/Applications/Glide.app`, then Quit & Reopen when asked
 - **Device Control and Data Access** (called Accessibility before macOS 27) — add the same app
 - **Local Network** — allow it when the prompt appears, or the peer is unreachable
 
-Add Glide to Login Items to have it start with the Mac.
+Glide does not start itself on the Mac, by design: the machine that owns the
+keyboard only shares it when you open the app. Quitting from the menu bar stops
+it. Nothing is installed in `~/Library/LaunchAgents`, and it does not belong in
+Login Items.
 
 That is it. Push the cursor off the edge you configured and it appears on the
 other machine.
@@ -119,6 +146,9 @@ key somewhere safe: rebuild with a different certificate and the grants reset.
 
 ```toml
 name = "goldengate"
+role = "server"                # "server" shares this machine's keyboard and
+                               # mouse, "client" is driven by it. No default:
+                               # guessing it would hand control the wrong way.
 listen = "0.0.0.0:4242"
 
 [[peer]]
@@ -136,11 +166,43 @@ Every ten seconds each side logs the round trip to the other:
 INFO glide::link: rtt p50 2.37ms  p99 3.01ms  min 1.41ms  max 3.01ms  n=10 peer=anorak
 ```
 
+### The layout here
+
+`goldengate` is the server: its keyboard and mouse are the shared ones, and it
+only runs while the app is open. `anorak` is the client, started by the Hyprland
+session. `anorak` sits on the top edge of Display 1, so that whole edge is the
+crossing, and Display 2 is not part of it.
+
+```
+                  +------------------+
+                  |                  |      anorak — client
+                  |      anorak      |      Arch, Hyprland, HDMI-A-2
+                  |     HDMI-A-2     |      typed on, never types back
+                  |                  |      starts with the session
+                  +==================+
+                            |
+             the cursor crosses here, anywhere along
+             the top edge of Display 1   ( position = "top", display = 1 )
+                            |
+   +========================+==================+   +-----------+
+   |                                           |   |           |
+   |         goldengate  —  Display 1          |   |           |
+   |        LG ULTRAWIDE    2560 x 1080        |   | Display 2 |
+   |                                           |   |   DELL    |
+   +-------------------------------------------+   |  P2422H   |
+                                                   | 1080x1920 |
+      goldengate — server                          |           |
+      macOS, owns the keyboard and mouse           |  no edge  |
+      runs only while you have Glide open          |  armed    |
+                                                   +-----------+
+```
+
 ### Per-machine notes
 
 - **macOS** — the app bundle holds the daemon and the menu bar in one process.
   Its menu shows who is connected and which way input is flowing, and opens a
-  window that draws both machines' real displays for arranging them.
+  window that draws both machines' real displays for arranging them. It starts
+  only when you open it.
 - **Hyprland** — `contrib/waybar-glide.md` has a waybar module and matching CSS.
 - **lan-mouse** — it holds the same port and grabs the same screen edges, so the
   two cannot run together. Its XDG autostart entry has to go.
