@@ -217,18 +217,25 @@ pub async fn session(
     }
 
     let mut handover = Handover::new(!server);
-    // Every captured motion event used to lock the status and compare strings.
-    // Only a change is worth that, and the label is a `&'static str`.
-    let mut shown = "";
-    let publish = |handover: &Handover, degraded: bool, shown: &mut &'static str| {
-        let now = handover.name();
+    // This runs on every captured motion event, so it must touch nothing that
+    // allocates unless something actually changed: `Status::set` clones the
+    // whole state to compare it, and at a thousand events a second that is all
+    // wasted work on the path that has to stay quick.
+    let mut shown = ("", !degraded);
+    let publish = |handover: &Handover, degraded: bool, shown: &mut (&'static str, bool)| {
+        let now = (handover.name(), !degraded);
         if *shown != now {
             *shown = now;
-            status.set(|s| s.mode = now.into());
+            status.set(|s| {
+                s.mode = now.0.into();
+                s.denied = degraded;
+            });
         }
-        status.allowed(!degraded);
     };
-    publish(&handover, degraded, &mut shown);
+    status.set(|s| {
+        s.mode = handover.name().into();
+        s.denied = degraded;
+    });
     loop {
         tokio::select! {
             captured = next_capture(capture.as_mut()) => match captured {
@@ -280,7 +287,15 @@ pub async fn session(
                     }
                     publish(&handover, degraded, &mut shown);
                 }
-                Some(Err(e)) => warn!("capture error: {e}"),
+                // The event tap dies for reasons outside this process: a
+                // password field turning on secure input, a revoked grant. Put
+                // input back on this machine rather than leaving the cursor
+                // believed to be somewhere else.
+                Some(Err(e)) => {
+                    warn!("capture error, input is local again: {e}");
+                    handover.take_back();
+                    publish(&handover, degraded, &mut shown);
+                }
                 None => {
                     warn!("capture ended");
                     break;

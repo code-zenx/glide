@@ -513,11 +513,10 @@ fn create_event_tap<'a>(
                 let _ = CGDisplay::show_cursor(&CGDisplay::main());
                 state.current_pos = None;
             }
-            notify_tx
-                .blocking_send(ProducerEvent::EventTapDisabled)
-                .unwrap_or_else(|e| {
-                    log::error!("Failed to send notification: {e}");
-                });
+            // glide: try_send, never blocking_send — see the channel comment.
+            if let Err(e) = notify_tx.try_send(ProducerEvent::EventTapDisabled) {
+                log::error!("Failed to send notification: {e}");
+            }
             return CallbackResult::Keep;
         }
 
@@ -552,17 +551,30 @@ fn create_event_tap<'a>(
                     .start_capture(cg_ev, new_pos)
                     .unwrap_or_else(|e| log::warn!("{e}"));
                 res_events.push(CaptureEvent::Begin);
-                notify_tx
-                    .blocking_send(ProducerEvent::Grab(new_pos))
-                    .expect("Failed to send notification");
+                // glide: was a blocking_send with an `.expect`. Blocking here
+                // stalls every application's input; panicking here kills the
+                // tap thread and leaves the cursor hidden.
+                if let Err(e) = notify_tx.try_send(ProducerEvent::Grab(new_pos)) {
+                    log::error!("cannot hide the cursor: {e}");
+                }
             }
         }
 
+        // glide: the state lock is held by every system event this tap sees,
+        // and the consumer needs it to process a release. Holding it across a
+        // send that can wait is what wedged the whole machine.
+        drop(state);
+
         if let Some(pos) = capture_position {
             res_events.iter().for_each(|e| {
-                // error must be ignored, since the event channel
-                // may already be closed when the InputCapture instance is dropped.
-                let _ = event_tx.blocking_send((pos, *e));
+                // glide: try_send, not blocking_send. A full channel means the
+                // consumer is behind; dropping a motion event costs a little
+                // cursor accuracy, while waiting costs the user their keyboard
+                // until they reboot. An error is also expected once the
+                // InputCapture is dropped and the channel closes.
+                if let Err(mpsc::error::TrySendError::Full(_)) = event_tx.try_send((pos, *e)) {
+                    log::warn!("input is arriving faster than it is being sent; dropped an event");
+                }
             });
             // Returning Drop should stop the event from being processed
             // but core fundation still returns the event
@@ -673,7 +685,9 @@ extern "C" fn display_reconfiguration_callback(_display: u32, flags: u32, user_i
     // freed. The callback only fires while the run loop is running
     // on that thread, so we know the box is live here.
     let sender = unsafe { &*(user_info as *const Sender<ProducerEvent>) };
-    if let Err(e) = sender.blocking_send(ProducerEvent::DisplayReconfigured) {
+    // glide: try_send, never blocking_send — a run-loop callback that waits
+    // stalls everything else scheduled on that run loop.
+    if let Err(e) = sender.try_send(ProducerEvent::DisplayReconfigured) {
         log::warn!("failed to notify display reconfiguration: {e}");
     }
 }
@@ -694,8 +708,13 @@ impl MacOSInputCapture {
         let state = Arc::new(Mutex::new(InputCaptureState::new()?));
         // glide: keep a handle for the public API; the tap thread takes the rest.
         let shared_state = state.clone();
-        let (event_tx, event_rx) = mpsc::channel(32);
-        let (notify_tx, mut notify_rx) = mpsc::channel(32);
+        // glide: deep enough that a normal hitch in the consumer never fills
+        // it. The tap callback drops events rather than waiting when it does:
+        // this tap sits in the system's input path, so a callback that blocks
+        // freezes the keyboard and mouse for every application, not just this
+        // one. 1024 is about a second of pointer motion.
+        let (event_tx, event_rx) = mpsc::channel(1024);
+        let (notify_tx, mut notify_rx) = mpsc::channel(256);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (tap_exit_tx, mut tap_exit_rx) = oneshot::channel();
 
