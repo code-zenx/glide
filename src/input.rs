@@ -322,9 +322,9 @@ pub async fn session(
                             }
                         }
                     }
-                    Msg::Clipboard(text) => {
-                        info!(%peer, bytes = text.len(), "clipboard arrived");
-                        tokio::spawn(crate::clipboard::write(text));
+                    Msg::Clipboard(clip) => {
+                        info!(%peer, "clipboard arrived");
+                        tokio::spawn(crate::clipboard::write(clip));
                     }
                     Msg::Arrange(side) => {
                         info!(%peer, ?side, "peer says it sits on our {side:?}");
@@ -378,8 +378,8 @@ async fn release(capture: Option<&mut InputCapture>) -> Result<()> {
 fn push_clipboard(links: &Arc<Links>, peer: &str) {
     let (links, peer) = (links.clone(), peer.to_string());
     tokio::spawn(async move {
-        if let Some(text) = crate::clipboard::read().await {
-            links.send(&peer, Msg::Clipboard(text));
+        if let Some(clip) = crate::clipboard::read().await {
+            links.send(&peer, Msg::Clipboard(clip));
         }
     });
 }

@@ -8,6 +8,7 @@
 use anyhow::{bail, Context, Result};
 use input_event::{Event, KeyboardEvent, PointerEvent};
 
+use crate::clipboard::Clip;
 use crate::screens::Screen;
 use crate::Side;
 
@@ -22,8 +23,9 @@ pub enum Msg {
     /// "You have the cursor back."
     Leave,
     Input(Event),
-    /// Clipboard text, sent when the cursor changes machine.
-    Clipboard(String),
+    /// Whatever was copied: text, or an image in the bytes the clipboard
+    /// already held.
+    Clipboard(Clip),
     /// The screens this machine has, sent once per connection so the other end
     /// can draw the real layout.
     Screens(Vec<Screen>),
@@ -58,9 +60,15 @@ impl Msg {
                 out.push(4);
                 encode_event(event, &mut out);
             }
-            Msg::Clipboard(text) => {
+            Msg::Clipboard(Clip::Text(text)) => {
                 out.push(5);
                 out.extend_from_slice(text.as_bytes());
+            }
+            Msg::Clipboard(Clip::Image { mime, bytes }) => {
+                out.push(8);
+                out.push(mime.len().min(u8::MAX as usize) as u8);
+                out.extend_from_slice(&mime.as_bytes()[..mime.len().min(u8::MAX as usize)]);
+                out.extend_from_slice(bytes);
             }
             Msg::Arrange(side) => {
                 out.push(7);
@@ -90,7 +98,15 @@ impl Msg {
             2 => Msg::Enter,
             3 => Msg::Leave,
             4 => Msg::Input(decode_event(rest)?),
-            5 => Msg::Clipboard(String::from_utf8(rest.to_vec())?),
+            5 => Msg::Clipboard(Clip::Text(String::from_utf8(rest.to_vec())?)),
+            8 => {
+                let (&len, rest) = rest.split_first().context("no mime length")?;
+                let mime = rest.get(..len as usize).context("truncated mime type")?;
+                Msg::Clipboard(Clip::Image {
+                    mime: String::from_utf8(mime.to_vec())?,
+                    bytes: rest[len as usize..].to_vec(),
+                })
+            }
             6 => {
                 let (&count, mut rest) = rest.split_first().context("no screen count")?;
                 let mut screens = Vec::with_capacity(count as usize);
@@ -218,7 +234,9 @@ mod tests {
             Msg::Pong(u64::MAX),
             Msg::Enter,
             Msg::Leave,
-            Msg::Clipboard("hello wörld".into()),
+            Msg::Clipboard(Clip::Text("hello wörld".into())),
+            Msg::Clipboard(Clip::Image { mime: "image/png".into(), bytes: vec![0x89, b'P', 0, 255] }),
+            Msg::Clipboard(Clip::Image { mime: "image/jpeg".into(), bytes: Vec::new() }),
             Msg::Screens(vec![
                 Screen { name: "Display 1".into(), x: 0, y: 0, w: 1512, h: 982 },
                 Screen { name: "DP-1".into(), x: 1512, y: -200, w: 2560, h: 1440 },
@@ -249,7 +267,7 @@ mod tests {
         assert!(!Msg::Input(Event::Pointer(PointerEvent::Motion { time: 0, dx: 1.0, dy: 0.0 })).reliable());
         assert!(Msg::Input(Event::Keyboard(KeyboardEvent::Key { time: 0, key: 1, state: 0 })).reliable());
         assert!(Msg::Enter.reliable());
-        assert!(Msg::Clipboard(String::new()).reliable());
+        assert!(Msg::Clipboard(Clip::Text(String::new())).reliable());
     }
 
     #[test]

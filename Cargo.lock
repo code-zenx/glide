@@ -739,6 +739,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "wl-clipboard-rs",
 ]
 
 [[package]]

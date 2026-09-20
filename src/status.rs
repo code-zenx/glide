@@ -43,6 +43,7 @@ impl State {
     }
 
     /// Who this machine is linked to, and whether it is linked at all.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn headline(&self) -> String {
         match self.mode.as_str() {
             _ if self.denied => "Input permission needed".into(),
@@ -52,6 +53,7 @@ impl State {
     }
 
     /// Which way input is flowing right now.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn flow(&self) -> String {
         if self.denied {
             return "Grant Input Monitoring and Device Control".into();
@@ -65,6 +67,7 @@ impl State {
     }
 
     /// The round trip, spelled out.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn speed(&self) -> String {
         match self.rtt_ms {
             Some(rtt) => format!("{rtt:.2} ms round trip"),

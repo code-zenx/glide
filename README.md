@@ -1,9 +1,9 @@
 # glide
 
-Share one keyboard and mouse between a Mac and a Linux box on the same network.
-Either machine can drive the other: push the cursor off the edge of one screen and
-it appears on the other, and the keyboard follows it. Copy on either machine and
-the clipboard is on both.
+Share one keyboard, mouse and clipboard between a Mac and a Linux box on the same
+network. Either machine can drive the other: push the cursor off the edge of one
+screen and it appears on the other, and the keyboard follows it. Copy text or an
+image on either machine and it is on the other's clipboard a second later.
 
 Tested between macOS (`goldengate`) and Arch with Hyprland (`anorak`), linked by
 Ethernet: round trip 2.4 ms.
@@ -173,6 +173,20 @@ glide status --watch    # keep printing, once a second
   the badge can be coloured per state. `contrib/waybar-glide.md` has the module and the CSS
   as installed on anorak.
 
+## Clipboard
+
+Text and images, both directions, capped at 1 MB and 16 MB.
+
+Images cross as the bytes the clipboard already holds — `image/png`, `image/jpeg`
+or `image/gif` — rather than being decoded to pixels and re-encoded. A screenshot
+is PNG on both platforms already, so it arrives lossless and at its original size:
+a terminal screenshot is a few hundred kilobytes, where the same image as raw
+pixels would be eleven megabytes. That also keeps change detection cheap, since
+the daemon hashes compressed bytes once a second rather than a full bitmap.
+
+macOS reads and writes the pasteboard by UTI, Hyprland by MIME type, so neither
+side needs an image library.
+
 ## Not done yet
 
 - **The cursor does not arrive at the matching spot.** Leave the top edge on the
@@ -185,7 +199,6 @@ glide status --watch    # keep printing, once a second
   clock-offset estimation.
 - **No pixel-accurate offsets along an edge.** A barrier is a whole side of a
   display, so two screens of different heights meet at whichever part overlaps.
-- Clipboard images. Text only, capped at 1 MB.
 - Preferring the lowest-latency address when several are up; today the first to
   answer wins.
 - mDNS discovery, and an arrange window on Linux — there, screens are arranged by

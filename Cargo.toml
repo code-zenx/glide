@@ -30,6 +30,11 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+# Reads and writes the clipboard by MIME type, so an image crosses as the bytes
+# it already is instead of a decoded bitmap.
+wl-clipboard-rs = "0.9"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
 objc2 = "0.6"

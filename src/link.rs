@@ -27,8 +27,9 @@ const PING_INTERVAL: Duration = Duration::from_secs(1);
 const STATS_INTERVAL: Duration = Duration::from_secs(10);
 /// Enough samples for a meaningful p99 without keeping history forever.
 const SAMPLE_WINDOW: usize = 200;
-/// Refuse absurd frames rather than allocating for them.
-const MAX_FRAME: usize = 1 << 20;
+/// Refuse absurd frames rather than allocating for them. A clipboard image is
+/// the largest thing that legitimately crosses, so this tracks its cap.
+const MAX_FRAME: usize = crate::clipboard::MAX_IMAGE + (1 << 16);
 
 /// Every peer this machine can currently talk to, by name.
 #[derive(Default)]
