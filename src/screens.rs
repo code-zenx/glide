@@ -109,10 +109,14 @@ mod tests {
     }
 
     #[test]
-    fn this_machine_reports_at_least_one_screen() {
-        // A machine with no screen at all would make the arrange window lie.
+    fn every_screen_reported_is_one_that_could_be_drawn() {
         let screens = local();
-        assert!(!screens.is_empty(), "no screens found");
         assert!(screens.iter().all(|s| s.w > 0 && s.h > 0), "{screens:?}");
+        // Asking for the screens needs a session to ask. Over SSH or in CI
+        // there is no compositor and reporting nothing is the right answer;
+        // where there is one, a machine with no screen would make the arrange
+        // window lie.
+        let session = cfg!(target_os = "macos") || std::env::var_os("WAYLAND_DISPLAY").is_some();
+        assert!(!session || !screens.is_empty(), "a machine with a display must report one");
     }
 }
