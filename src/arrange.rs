@@ -27,8 +27,15 @@ use crate::input::Control;
 use crate::screens::Screen;
 use crate::Side;
 
-/// Empty space around the drawing, in points.
+/// Empty space around the drawing, in points. A machine's name pill sits in
+/// this margin, above or below its screens.
 const PADDING: f64 = 40.0;
+/// Room kept at the bottom for the hint line.
+const CAPTION: f64 = 34.0;
+/// What the titlebar covers when the view has no window to ask — the snapshot
+/// renders offscreen, and its picture should match what the window shows. The
+/// window itself measures instead; 32 is what this style mask reports today.
+const TITLEBAR: f64 = 32.0;
 /// Screens on one desktop touch; the other machine is drawn touching too, the
 /// way the Displays pane does it. The accent border is what tells them apart,
 /// not a canyon of empty space.
@@ -231,6 +238,23 @@ impl ArrangeView {
         (local, peers)
     }
 
+    /// The part of the view the drawing may use: everything the titlebar does
+    /// not cover, less the strip the hint sits in. The window draws its content
+    /// edge to edge, so nothing moves the drawing out from under the title but
+    /// this — otherwise the peer's name pill lands on top of it.
+    fn canvas(&self) -> NSRect {
+        let bounds = self.bounds();
+        let covered = self
+            .window()
+            .map(|w| bounds.size.height - w.contentLayoutRect().size.height)
+            .unwrap_or(TITLEBAR)
+            .clamp(0.0, bounds.size.height);
+        NSRect::new(
+            NSPoint::new(bounds.origin.x, bounds.origin.y + covered),
+            NSSize::new(bounds.size.width, (bounds.size.height - covered - CAPTION).max(1.0)),
+        )
+    }
+
     fn draw(&self) {
         let view = self.bounds();
         match gradient(&ink(0.105, 1.0), &ink(0.07, 1.0)) {
@@ -240,15 +264,17 @@ impl ArrangeView {
                 NSBezierPath::fillRect(view);
             }
         }
+        self.caption(view);
 
+        let canvas = self.canvas();
         let (local, peers) = self.boxes();
         let all: Vec<(NSRect, String)> = local.iter().chain(peers.iter()).cloned().collect();
         let Some(world) = union(&all) else { return };
 
-        let scale = ((view.size.width - PADDING * 2.0) / world.size.width)
-            .min((view.size.height - PADDING * 2.0) / world.size.height);
-        let left = (view.size.width - world.size.width * scale) / 2.0;
-        let top = (view.size.height - world.size.height * scale) / 2.0;
+        let scale = ((canvas.size.width - PADDING * 2.0) / world.size.width)
+            .min((canvas.size.height - PADDING * 2.0) / world.size.height);
+        let left = canvas.origin.x + (canvas.size.width - world.size.width * scale) / 2.0;
+        let top = canvas.origin.y + (canvas.size.height - world.size.height * scale) / 2.0;
         let place = |r: NSRect| {
             NSRect::new(
                 NSPoint::new(
@@ -407,6 +433,23 @@ impl ArrangeView {
         }
     }
 
+    /// The hint, along the bottom. It lived in the window's subtitle before,
+    /// where a whole sentence stretched the titlebar across the drawing.
+    fn caption(&self, view: NSRect) {
+        let text = NSString::from_str(HINT);
+        let attributes = text_style(11.0, ink(0.46, 1.0));
+        let size = unsafe { text.sizeWithAttributes(Some(&attributes)) };
+        unsafe {
+            text.drawAtPoint_withAttributes(
+                NSPoint::new(
+                    (view.size.width - size.width) / 2.0,
+                    view.size.height - (CAPTION + size.height) / 2.0,
+                ),
+                Some(&attributes),
+            )
+        };
+    }
+
     /// The machine's name on a pill above its group of screens.
     fn badge(&self, group: NSRect, name: &str, is_peer: bool, below: bool) {
         let text = NSString::from_str(name);
@@ -488,7 +531,7 @@ fn union(boxes: &[(NSRect, String)]) -> Option<NSRect> {
     Some(NSRect::new(NSPoint::new(x0, y0), NSSize::new(x1 - x0, y1 - y0)))
 }
 
-/// Shown under the title, because a drag that snaps needs explaining.
+/// Shown along the bottom, because a drag that snaps needs explaining.
 const HINT: &str = "Drag the other machine to the side of this Mac it sits on";
 
 /// Render the window's drawing straight to a PNG, so the design can be looked
@@ -575,7 +618,6 @@ pub fn window(
         )
     };
     window.setTitle(ns_string!("Arrange Screens"));
-    window.setSubtitle(&NSString::from_str(HINT));
     window.setTitlebarAppearsTransparent(true);
     window.setMinSize(NSSize::new(520.0, 360.0));
     window.setContentView(Some(&view));

@@ -171,31 +171,33 @@ INFO glide::link: rtt p50 2.37ms  p99 3.01ms  min 1.41ms  max 3.01ms  n=10 peer=
 `goldengate` is the server: its keyboard and mouse are the shared ones, and it
 only runs while the app is open. `anorak` is the client, started by the Hyprland
 session. `anorak` sits on the top edge of Display 1, so that whole edge is the
-crossing, and Display 2 is not part of it.
+crossing.
+
+Screens as of 2026-09-21 — the Arrange window always draws the live ones:
 
 ```
-                  +------------------+
-                  |                  |      anorak — client
-                  |      anorak      |      Arch, Hyprland, HDMI-A-2
-                  |     HDMI-A-2     |      typed on, never types back
-                  |                  |      starts with the session
-                  +==================+
-                            |
-             the cursor crosses here, anywhere along
-             the top edge of Display 1   ( position = "top", display = 1 )
-                            |
-   +========================+==================+   +-----------+
-   |                                           |   |           |
-   |         goldengate  —  Display 1          |   |           |
-   |        LG ULTRAWIDE    2560 x 1080        |   | Display 2 |
-   |                                           |   |   DELL    |
-   +-------------------------------------------+   |  P2422H   |
-                                                   | 1080x1920 |
-      goldengate — server                          |           |
-      macOS, owns the keyboard and mouse           |  no edge  |
-      runs only while you have Glide open          |  armed    |
-                                                   +-----------+
+              +--------------------+
+              |                    |     anorak — client
+              |       anorak       |     Arch, Hyprland, HDMI-A-2
+              |      HDMI-A-2      |     typed on, never types back
+              |     1920 x 1080    |     starts with the session
+              |                    |
+              +====================+
+                        ^
+              the cursor crosses this whole edge
+              ( position = "top", display = 1 )
+                        v
+              +====================+
+              |                    |     goldengate — server
+              |     goldengate     |     macOS, owns the keyboard and mouse
+              |      Display 1     |     runs only while you have Glide open
+              |     1920 x 1243    |
+              |                    |
+              +--------------------+
 ```
+
+With more displays attached, `display = 1` picks which one owns the edge; the
+others are drawn but arm nothing.
 
 ### Per-machine notes
 
