@@ -1,0 +1,46 @@
+[package]
+name = "glide"
+version = "0.1.0"
+edition = "2021"
+description = "Share one keyboard and mouse between a Mac and a Linux box over the LAN"
+license = "GPL-3.0"
+
+[dependencies]
+anyhow = "1"
+arboard = { version = "3", features = ["wayland-data-control"] }
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+# Only the backends these two machines actually use: libei on Hyprland, macOS
+# natively. X11 and the remote-desktop portal are dead weight here.
+# Forked: upstream puts a capture barrier on the union of every display, so a
+# peer can only sit off the outermost screen. vendor/ adds a per-display
+# barrier. See vendor/input-capture/GLIDE-CHANGES.md.
+input-capture = { path = "vendor/input-capture", default-features = false, features = ["libei", "layer_shell"] }
+input-emulation = { version = "0.4", default-features = false, features = ["wlroots", "libei"] }
+input-event = "0.4"
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-app-kit = "0.3"
+objc2-core-foundation = "0.3"
+objc2-foundation = "0.3"
+
+[profile.release]
+# A small, quick binary matters more here than fast rebuilds: this runs all day.
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"

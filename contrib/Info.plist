@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Glide.app bundle template. contrib/bundle.sh copies this to
+  Glide.app/Contents/Info.plist verbatim.
+
+  No privacy usage-description strings here on purpose. Glide needs
+  Accessibility and Input Monitoring, and neither TCC service reads a string
+  from Info.plist - macOS shows its own prompt. It sends no Apple Events and
+  touches no camera, microphone or screen recording, so
+  NSAppleEventsUsageDescription and friends would be dead weight.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Glide</string>
+	<key>CFBundleDisplayName</key>
+	<string>Glide</string>
+	<key>CFBundleIdentifier</key>
+	<string>dev.glide</string>
+	<key>CFBundleExecutable</key>
+	<string>glide</string>
+	<key>CFBundleIconFile</key>
+	<string>Glide</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>LSUIElement</key>
+	<true/>
+</dict>
+</plist>
