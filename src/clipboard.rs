@@ -69,6 +69,7 @@ pub async fn read() -> Option<Clip> {
 
 /// Put a peer's clipboard on this machine's.
 pub async fn write(clip: Clip) {
+    debug!("writing {} to the clipboard", clip.describe());
     // Remember it before it lands, so the watcher does not mistake it for a
     // local copy and bounce it back to the peer it came from.
     *LAST_SEEN.lock().unwrap() = Some(clip.fingerprint());
@@ -209,18 +210,24 @@ fn read_image() -> Option<Clip> {
 fn write_image(mime: &str, bytes: Vec<u8>) {
     use wl_clipboard_rs::copy::{copy, MimeType, Options, Source};
 
-    let mut options = Options::new();
-    // Serve paste requests on a thread of this process, so `copy` returns at
-    // once. Blocking here instead would hold the thread until someone else
-    // copies something, and the thread dies with the daemon either way.
-    options.foreground(false);
-    if let Err(e) = copy(
-        options,
-        Source::Bytes(bytes.into_boxed_slice()),
-        MimeType::Specific(mime.to_string()),
-    ) {
-        debug!("cannot put {mime} on the clipboard: {e}");
-    }
+    // Serve the paste requests on a thread of our own, rather than letting
+    // `copy` spawn one: in foreground mode it reports why it stopped, where the
+    // spawned version throws that away, and it stopped immediately here without
+    // ever taking the selection. The thread lives until something else copies,
+    // which cancels the data source and ends the call.
+    let (mime, len) = (mime.to_string(), bytes.len());
+    std::thread::spawn(move || {
+        let mut options = Options::new();
+        options.foreground(true);
+        match copy(
+            options,
+            Source::Bytes(bytes.into_boxed_slice()),
+            MimeType::Specific(mime.clone()),
+        ) {
+            Ok(()) => debug!("{len} bytes of {mime} left the clipboard, replaced by another copy"),
+            Err(e) => debug!("cannot put {mime} on the clipboard: {e}"),
+        }
+    });
 }
 
 #[cfg(test)]
