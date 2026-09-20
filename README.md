@@ -10,8 +10,8 @@ keyboard and mouse are being shared; the **client** is the machine it drives. A
 client arms no screen edge and a server builds no typing backend, so neither end
 can take the other over by accident.
 
-Tested between macOS (`goldengate`) and Arch with Hyprland (`anorak`), linked by
-Ethernet: round trip 2.4 ms.
+Tested between macOS and Arch with Hyprland, linked by Ethernet: round trip
+2.4 ms.
 
 ## How it is built
 
@@ -145,15 +145,15 @@ key somewhere safe: rebuild with a different certificate and the grants reset.
 ## Configuration
 
 ```toml
-name = "goldengate"
+name = "mymac"
 role = "server"                # "server" shares this machine's keyboard and
                                # mouse, "client" is driven by it. No default:
                                # guessing it would hand control the wrong way.
 listen = "0.0.0.0:4242"
 
 [[peer]]
-name = "anorak"
-addrs = ["192.168.2.3:4242"]   # several are allowed: Ethernet, Wi-Fi, Tailscale
+name = "mybox"
+addrs = ["192.168.1.50:4242"]  # several are allowed: Ethernet, Wi-Fi, Tailscale
 position = "top"               # which edge of this machine the peer sits on
 display = 1                    # optional: which of this machine's displays owns
                                # that edge, numbered as the Arrange window shows
@@ -163,23 +163,21 @@ fingerprint = "8afca615..."    # from `glide fingerprint` on the other machine
 Every ten seconds each side logs the round trip to the other:
 
 ```
-INFO glide::link: rtt p50 2.37ms  p99 3.01ms  min 1.41ms  max 3.01ms  n=10 peer=anorak
+INFO glide::link: rtt p50 2.37ms  p99 3.01ms  min 1.41ms  max 3.01ms  n=10 peer=mybox
 ```
 
 ### The layout here
 
-`goldengate` is the server: its keyboard and mouse are the shared ones, and it
-only runs while the app is open. `anorak` is the client, started by the Hyprland
-session. `anorak` sits on the top edge of Display 1, so that whole edge is the
-crossing.
-
-Screens as of 2026-09-21 — the Arrange window always draws the live ones:
+A worked example. `mymac` is the server, so its keyboard and mouse are the shared
+ones and it only runs while the app is open. `mybox` is the client, started by
+the Hyprland session. `mybox` sits on the top edge of Display 1, so that whole
+edge is the crossing.
 
 ```
               +--------------------+
-              |                    |     anorak — client
-              |       anorak       |     Arch, Hyprland, HDMI-A-2
-              |      HDMI-A-2      |     typed on, never types back
+              |                    |     mybox — client
+              |       mybox        |     Arch, Hyprland
+              |     Display 1      |     typed on, never types back
               |     1920 x 1080    |     starts with the session
               |                    |
               +====================+
@@ -188,16 +186,17 @@ Screens as of 2026-09-21 — the Arrange window always draws the live ones:
               ( position = "top", display = 1 )
                         v
               +====================+
-              |                    |     goldengate — server
-              |     goldengate     |     macOS, owns the keyboard and mouse
-              |      Display 1     |     runs only while you have Glide open
+              |                    |     mymac — server
+              |       mymac        |     macOS, owns the keyboard and mouse
+              |     Display 1      |     runs only while you have Glide open
               |     1920 x 1243    |
               |                    |
               +--------------------+
 ```
 
-With more displays attached, `display = 1` picks which one owns the edge; the
-others are drawn but arm nothing.
+The Arrange window draws this from the live displays on both machines. With more
+than one attached, `display = 1` picks which one owns the edge; the others are
+drawn but arm nothing.
 
 ### Per-machine notes
 
@@ -216,7 +215,7 @@ and rewrites them only when something changes. Anything can read it without
 touching the daemon:
 
 ```sh
-glide status            # → ● 1.8ms   or   → anorak   or   ✕ offline
+glide status            # → ● 1.8ms   or   → mybox    or   ✕ offline
 glide status --json     # {"text":"● 1.8ms","tooltip":"...","class":"local"}
 glide status --watch    # keep printing, once a second
 ```
@@ -234,8 +233,8 @@ glide status --watch    # keep printing, once a second
   rounded-square badge the Mac shows.
 
   The `class` field is `local`, `sending`, `receiving`, `offline` or `denied`, so
-  the badge can be coloured per state. `contrib/waybar-glide.md` has the module and the CSS
-  as installed on anorak.
+  the badge can be coloured per state. `contrib/waybar-glide.md` has the
+  module and the CSS.
 
 ## Clipboard
 

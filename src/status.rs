@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn survives_a_round_trip() {
         let state =
-            State { peer: "anorak".into(), mode: "sending".into(), rtt_ms: Some(1.844), denied: true };
+            State { peer: "mybox".into(), mode: "sending".into(), rtt_ms: Some(1.844), denied: true };
         assert_eq!(State::decode(&state.encode()), state);
     }
 
@@ -241,12 +241,12 @@ mod tests {
     #[test]
     fn summaries_say_which_way_input_is_going() {
         let mut state =
-            State { peer: "anorak".into(), mode: "local".into(), rtt_ms: Some(1.84), denied: false };
+            State { peer: "mybox".into(), mode: "local".into(), rtt_ms: Some(1.84), denied: false };
         assert_eq!(state.summary(), "● 1.8ms");
         state.mode = "sending".into();
-        assert_eq!(state.summary(), "→ anorak");
+        assert_eq!(state.summary(), "→ mybox");
         state.mode = "receiving".into();
-        assert_eq!(state.summary(), "← anorak");
+        assert_eq!(state.summary(), "← mybox");
         state.mode = "offline".into();
         assert_eq!(state.summary(), "✕ offline");
     }
@@ -254,9 +254,9 @@ mod tests {
     #[test]
     fn the_badge_is_just_the_letter() {
         let state =
-            State { peer: "anorak".into(), mode: "sending".into(), rtt_ms: Some(2.0), denied: false };
+            State { peer: "mybox".into(), mode: "sending".into(), rtt_ms: Some(2.0), denied: false };
         assert!(state.json(true).contains(r#""text":"G""#), "{}", state.json(true));
-        assert!(state.json(false).contains("anorak"), "{}", state.json(false));
+        assert!(state.json(false).contains("mybox"), "{}", state.json(false));
         // A denied machine says so through the class, whatever the mode is.
         let denied = State { denied: true, ..state };
         assert!(denied.json(true).contains(r#""class":"denied""#), "{}", denied.json(true));
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn a_reconnect_cannot_erase_a_permission_problem() {
         let mut state =
-            State { peer: "anorak".into(), mode: "local".into(), rtt_ms: Some(1.8), denied: true };
+            State { peer: "mybox".into(), mode: "local".into(), rtt_ms: Some(1.8), denied: true };
         assert_eq!(state.summary(), "⚠ needs permission");
         // The link dropping and coming back only ever touches `mode`.
         state.mode = "offline".into();

@@ -11,7 +11,7 @@ connectivity modules) and define it:
 
 ```jsonc
   "custom/glide": {
-    "exec": "/home/sudomrx/projects/glide/target/release/glide status --json --watch",
+    "exec": "~/.local/bin/glide status --json --watch",
     "return-type": "json",
     "tooltip": true
   },
@@ -57,7 +57,7 @@ Catppuccin Mocha colours. GTK CSS: no custom properties, plain hex only.
 ```
 
 `min-width` on the label stops the bar jittering as the text changes between
-`✕ offline`, `● 1.8ms` and `→ goldengate`.
+`✕ offline`, `● 1.8ms` and `→ mymac`.
 
 ## Reload
 

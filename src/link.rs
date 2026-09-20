@@ -651,13 +651,13 @@ mod tests {
         let links = Links::default();
         links.send("ghost", Msg::Enter); // must not panic
         let (tx, mut rx) = unbounded_channel();
-        assert!(links.try_register("anorak", tx));
-        links.send("anorak", Msg::Enter);
+        assert!(links.try_register("mybox", tx));
+        links.send("mybox", Msg::Enter);
         assert_eq!(rx.try_recv().unwrap(), Msg::Enter);
         let (second, _second_rx) = unbounded_channel();
-        assert!(!links.try_register("anorak", second), "a second link must be refused");
-        links.unregister("anorak");
-        links.send("anorak", Msg::Leave);
+        assert!(!links.try_register("mybox", second), "a second link must be refused");
+        links.unregister("mybox");
+        links.send("mybox", Msg::Leave);
         assert!(rx.try_recv().is_err());
     }
 
