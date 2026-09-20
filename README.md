@@ -7,8 +7,8 @@ on either machine and it is on the other's clipboard a second later.
 
 Input goes one way, the way Barrier does it. The **server** is the machine whose
 keyboard and mouse are being shared; the **client** is the machine it drives. A
-client arms no screen edge and a server builds no typing backend, so neither end
-can take the other over by accident.
+client sends no input and a server accepts none, so neither end can take the
+other over by accident.
 
 Tested between macOS and Arch with Hyprland, linked by Ethernet: round trip
 2.4 ms.
@@ -27,8 +27,11 @@ Tested between macOS and Arch with Hyprland, linked by Ethernet: round trip
   [lan-mouse](https://github.com/feschber/lan-mouse): layer-shell capture and
   wlroots emulation on Hyprland, native event taps on macOS.
 - **Handover** — the server watches its own screen edges, so control follows the
-  cursor. Ctrl+Shift+Alt+Meta together yank input back if the client stops
-  answering.
+  cursor; the client watches one edge too, but only to hand control back, and
+  crossing it sends a single `Leave` and no input. Edges are armed when the link
+  comes up and dropped when it goes, so an edge never grabs the cursor with
+  nowhere to send it. Ctrl+Shift+Alt+Cmd together yank input back if the client
+  stops answering.
 - **Addresses** — a peer may list several (Ethernet, Wi-Fi, Tailscale). Both ends
   dial; the first connection that lands is used and the duplicate hangs up, so one
   end being firewalled costs nothing.
@@ -79,9 +82,9 @@ position = "right"             # where its screen sits: left, right, top, bottom
 fingerprint = "<the fingerprint printed on the other machine>"
 ```
 
-`position` is only read on the server — it is the edge the cursor leaves by.
-Rearranging from the macOS app tells the client about it too, so the two agree if
-the roles are ever swapped.
+On the server `position` is the edge the cursor leaves by; on the client it is
+the edge that hands control back, and the two must be opposites. Rearranging from
+the macOS app sends the client the opposite side, so they stay that way.
 
 ### 4. Run it
 
