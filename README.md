@@ -2,6 +2,11 @@
 
 **[Download](#download) · [Install](#install) · [Screens](#arranging-screens) · [Contributing](#contributing)**
 
+[![Release](https://img.shields.io/github/v/release/code-zenx/glide)](https://github.com/code-zenx/glide/releases/latest)
+![License](https://img.shields.io/badge/license-GPL--3.0-blue)
+![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Hyprland-8a6ff6)
+![Rust](https://img.shields.io/badge/built%20with-Rust-dea584)
+
 One keyboard and mouse for your Mac and Linux box. Move the cursor off your Mac
 screen and it shows up on Linux. Copy on one, paste on the other.
 
