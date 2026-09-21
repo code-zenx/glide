@@ -24,11 +24,26 @@ Wayland, and lan-mouse has no clipboard sync, so glide does both.
 - **Safe**: the link is encrypted, and only your two machines can connect.
 - Works with **macOS** and **Linux with Hyprland** (Wayland).
 
+## Requirements
+
+- A Mac with macOS 13 or newer (Apple Silicon for the download)
+- A Linux PC running Hyprland (Wayland)
+- Both on the same network
+
+## Download
+
+Get the latest build from [Releases](https://github.com/code-zenx/glide/releases/latest):
+
+- **Mac:** `Glide-macos-arm64.zip`. Unzip it, move `Glide.app` to Applications, then run
+  `xattr -dr com.apple.quarantine /Applications/Glide.app` once so macOS lets it open.
+- **Linux:** `glide-linux-x86_64.tar.gz`. Unpack it into `~/.local/bin`.
+
+Then follow steps 2 to 4 below. To build it yourself instead, you need
+[Rust](https://rustup.rs).
+
 ## Install
 
 ![Install steps](docs/images/install-steps.svg)
-
-You need [Rust](https://rustup.rs) on both machines.
 
 ### 1. Build
 
