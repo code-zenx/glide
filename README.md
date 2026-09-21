@@ -67,7 +67,8 @@ install -Dm755 target/release/glide ~/.local/bin/glide
 
 ### 2. Create a config
 
-Run these from the `glide` folder:
+Run these from the `glide` folder. If you downloaded glide, use
+`/Applications/Glide.app/Contents/MacOS/glide` on the Mac and `glide` on Linux instead.
 
 ```sh
 ./target/release/glide init --name mymac --role server    # on the Mac
@@ -173,6 +174,13 @@ On the Mac, the menu bar icon shows the same thing. For a waybar module, see
 - **Images do not paste on Linux?** Another program reading the clipboard can
   cancel it. Check for stray `wl-paste --watch` processes.
 - **Don't run lan-mouse at the same time.** It uses the same port and screen edges.
+
+## Limits
+
+- Two machines only: one Mac and one Linux PC.
+- The cursor does not land at the same spot on the other screen.
+- Cmd and Super keys are not swapped.
+- You type the other machine's IP by hand.
 
 ## Contributing
 
