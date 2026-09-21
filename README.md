@@ -1,5 +1,7 @@
 # <img src="docs/images/icon.png" width="32" align="absmiddle" alt=""> glide
 
+**[Download](#download) · [Install](#install) · [Screens](#arranging-screens) · [Contributing](#contributing)**
+
 One keyboard and mouse for your Mac and Linux box. Move the cursor off your Mac
 screen and it shows up on Linux. Copy on one, paste on the other.
 
