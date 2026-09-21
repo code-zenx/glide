@@ -1,0 +1,33 @@
+# Push a tag like v0.1.0 to build the Mac app and Linux binary and publish them.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: bash contrib/bundle.sh "$PWD/dist"
+      - run: cd dist && ditto -c -k --keepParent Glide.app Glide-macos-arm64.zip
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/Glide-macos-arm64.zip
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y pkg-config libwayland-dev libxkbcommon-dev
+      - run: cargo build --release
+      - run: tar -czf glide-linux-x86_64.tar.gz -C target/release glide
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: glide-linux-x86_64.tar.gz

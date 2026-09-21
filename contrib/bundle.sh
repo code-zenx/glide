@@ -48,7 +48,7 @@ cp "$contrib/Info.plist" "$app/Contents/Info.plist"
 # Prefer the local signing certificate; fall back to ad-hoc with a warning,
 # because an ad-hoc build will silently lose its input permissions.
 identity="$(security find-certificate -c "Glide Self Signed" -Z 2>/dev/null \
-  | awk '/SHA-1 hash/{print $3; exit}')"
+  | awk '/SHA-1 hash/{print $3; exit}' || true)"
 if [ -n "$identity" ]; then
   codesign --force --deep --sign "$identity" "$app"
 else
