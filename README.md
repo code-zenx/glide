@@ -1,15 +1,10 @@
-<p align="center">
-  <img src="docs/images/icon.png" width="128" alt="glide icon">
-</p>
+# <img src="docs/images/icon.png" width="36" align="center" alt=""> glide
 
-<h1 align="center">glide</h1>
-
-Use one keyboard and mouse on two computers: a Mac and a Linux box.
-Move the cursor off the edge of your Mac screen and it shows up on Linux.
-Copy on one machine, paste on the other.
+One keyboard and mouse for your Mac and Linux box. Move the cursor off your Mac
+screen and it shows up on Linux. Copy on one, paste on the other.
 
 Inspired by [Barrier](https://github.com/debauchee/barrier) and
-[lan-mouse](https://github.com/feschber/lan-mouse). Barrier does not work on
+[lan-mouse](https://github.com/feschber/lan-mouse): Barrier does not work on
 Wayland, and lan-mouse has no clipboard sync, so glide does both.
 
 ![How glide works](docs/images/how-it-works.svg)
