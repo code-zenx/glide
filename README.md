@@ -1,4 +1,8 @@
-# glide
+<p align="center">
+  <img src="docs/images/icon.png" width="128" alt="glide icon">
+</p>
+
+<h1 align="center">glide</h1>
 
 Use one keyboard and mouse on two computers: a Mac and a Linux box.
 Move the cursor off the edge of your Mac screen and it shows up on Linux.
