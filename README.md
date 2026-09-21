@@ -1,275 +1,191 @@
 # glide
 
-Share one keyboard, mouse and clipboard between a Mac and a Linux box on the same
-network. Push the cursor off the edge of the screen that owns the keyboard and it
-appears on the other machine, and the keyboard follows it. Copy text or an image
-on either machine and it is on the other's clipboard a second later.
+Use one keyboard and mouse on two computers: a Mac and a Linux box.
+Move the cursor off the edge of your Mac screen and it shows up on Linux.
+Copy on one machine, paste on the other.
 
-Input goes one way, the way Barrier does it. The **server** is the machine whose
-keyboard and mouse are being shared; the **client** is the machine it drives. A
-client sends no input and a server accepts none, so neither end can take the
-other over by accident.
+Inspired by [Barrier](https://github.com/debauchee/barrier) and
+[lan-mouse](https://github.com/feschber/lan-mouse). Barrier does not work on
+Wayland, and lan-mouse has no clipboard sync, so glide does both.
 
-Tested between macOS and Arch with Hyprland, linked by Ethernet: round trip
-2.4 ms.
+![How glide works](docs/images/how-it-works.svg)
 
-## How it is built
+## What it does
 
-- **Transport** — QUIC (`quinn`), on three channels. Pointer motion travels as
-  unreliable datagrams, so a lost packet never stalls the cursor. Keys, buttons and
-  cursor handover share one small reliable stream, so nothing gets stuck down. Each
-  clipboard item gets a stream of its own, because a sixteen-megabyte image on the
-  input stream would delay every key queued behind it by the whole image.
-- **Trust** — each machine generates a self-signed certificate on first run and
-  pins the other's fingerprint, checked in both directions. No CA, no password;
-  nothing else on the network can connect or inject input.
-- **Input** — the `input-capture` and `input-emulation` crates from
-  [lan-mouse](https://github.com/feschber/lan-mouse): layer-shell capture and
-  wlroots emulation on Hyprland, native event taps on macOS.
-- **Handover** — the server watches its own screen edges, so control follows the
-  cursor; the client watches one edge too, but only to hand control back, and
-  crossing it sends a single `Leave` and no input. Edges are armed when the link
-  comes up and dropped when it goes, so an edge never grabs the cursor with
-  nowhere to send it. Ctrl+Shift+Alt+Cmd together yank input back if the client
-  stops answering.
-- **Addresses** — a peer may list several (Ethernet, Wi-Fi, Tailscale). Both ends
-  dial; the first connection that lands is used and the duplicate hangs up, so one
-  end being firewalled costs nothing.
+- **Keyboard and mouse** go one way: from the Mac (server) to Linux (client).
+- **Clipboard** goes both ways: text and images.
+- **Fast**: about 2 ms on a wired network.
+- **Safe**: the link is encrypted, and only your two machines can connect.
+- Works with **macOS** and **Linux with Hyprland** (Wayland).
 
 ## Install
 
-You need [Rust](https://rustup.rs) on both machines. Build takes about a minute.
+![Install steps](docs/images/install-steps.svg)
 
-### 1. Build, on each machine
+You need [Rust](https://rustup.rs) on both machines.
+
+### 1. Build
 
 ```sh
 git clone https://github.com/code-zenx/glide.git
 cd glide
+```
+
+On **macOS**, build the app:
+
+```sh
+bash contrib/bundle.sh        # installs /Applications/Glide.app
+```
+
+On **Linux**:
+
+```sh
 cargo build --release
+install -Dm755 target/release/glide ~/.local/bin/glide
 ```
 
-**macOS** — build the app bundle instead, so macOS has one thing to trust:
+### 2. Create a config
+
+Run these from the `glide` folder:
 
 ```sh
-bash contrib/bundle.sh          # builds and installs /Applications/Glide.app
+./target/release/glide init --name mymac --role server    # on the Mac
+./target/release/glide init --name mybox --role client    # on Linux
 ```
 
-### 2. Create a config, on each machine
+Then print each machine's fingerprint and write it down:
 
 ```sh
-# on the machine with the keyboard and mouse
-./target/release/glide init --name mymac --role server
-
-# on the machine it drives
-./target/release/glide init --name mybox --role client
-
-./target/release/glide fingerprint            # note this down, on both
+./target/release/glide fingerprint
 ```
 
 ### 3. Tell each machine about the other
 
-Edit `~/.config/glide/config.toml` on both. Each one lists the *other* machine:
+Edit `~/.config/glide/config.toml` on both machines. Each one lists the *other*
+machine.
+
+On the Mac:
 
 ```toml
-name = "mymac"                 # this machine
-role = "server"                # "client" on the machine being driven
-listen = "0.0.0.0:4242"
+name = "mymac"
+role = "server"
 
 [[peer]]
-name = "mybox"                 # the other machine
-addrs = ["192.168.1.50:4242"]  # its IP
-position = "right"             # where its screen sits: left, right, top, bottom
-fingerprint = "<the fingerprint printed on the other machine>"
+name = "mybox"
+addrs = ["192.168.1.50:4242"]           # the Linux box's IP
+position = "top"                        # Linux sits above the Mac
+fingerprint = "<fingerprint from Linux>"
 ```
 
-On the server `position` is the edge the cursor leaves by; on the client it is
-the edge that hands control back, and the two must be opposites. Rearranging from
-the macOS app sends the client the opposite side, so they stay that way.
+On Linux:
 
-### 4. Run it
+```toml
+name = "mybox"
+role = "client"
 
-**Linux (the client), started by the session:**
+[[peer]]
+name = "mymac"
+addrs = ["192.168.1.20:4242"]           # the Mac's IP
+position = "bottom"                     # always the opposite side
+fingerprint = "<fingerprint from the Mac>"
+```
+
+### 4. Run
+
+**Mac:** open Glide from Applications. It does not start at login, so it only
+runs when you open it. The first time, allow it in
+System Settings → Privacy & Security:
+
+- Input Monitoring
+- Accessibility (called "Device Control and Data Access" on macOS 27)
+- Local Network
+
+**Linux:** start it with your Hyprland session. Copy the service file:
 
 ```sh
-install -Dm755 target/release/glide ~/.local/bin/glide
 cp contrib/glide.service ~/.config/systemd/user/
 systemctl --user daemon-reload
 ```
 
-systemd knows nothing about Wayland, so hand it the session's environment from
-`hyprland.conf` and start it from there:
+Add these two lines to `hyprland.conf`:
 
 ```
 exec-once = systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR HYPRLAND_INSTANCE_SIGNATURE
 exec-once = systemctl --user start glide.service
 ```
 
-Without that import the daemon starts with no `WAYLAND_DISPLAY` and can neither
-capture nor reach the clipboard. The unit has no `[Install]` section on purpose:
-plain Hyprland never reaches `graphical-session.target`, so an enabled unit would
-wait for it forever.
+That's it. Push the cursor off the edge and it moves to the other machine.
 
-**macOS (the server), started by you.** Open Glide from Applications, then grant
-it two permissions in System Settings → Privacy & Security:
+## Arranging screens
 
-- **Input Monitoring** — add `/Applications/Glide.app`, then Quit & Reopen when asked
-- **Device Control and Data Access** (called Accessibility before macOS 27) — add the same app
-- **Local Network** — allow it when the prompt appears, or the peer is unreachable
+![Screen layout](docs/images/screen-layout.svg)
 
-Glide does not start itself on the Mac, by design: the machine that owns the
-keyboard only shares it when you open the app. Quitting from the menu bar stops
-it. Nothing is installed in `~/Library/LaunchAgents`, and it does not belong in
-Login Items.
+`position` says which edge of your screen the other machine is on:
+`left`, `right`, `top` or `bottom`. The two machines must use opposite sides.
 
-That is it. Push the cursor off the edge you configured and it appears on the
-other machine.
+If you have more than one display, add `display = 1` (or 2, 3…) to pick which
+display owns the edge.
 
-### Keeping macOS permissions across rebuilds
+On the Mac you can also drag the screens into place: open the menu bar icon and
+choose **Arrange Screens…**. The other machine is updated for you.
 
-macOS ties a permission grant to the app's code signature. An ad-hoc signature
-changes on every build, so every rebuild silently loses the grant. Sign with a
-certificate — any certificate, including a self-signed one — and the grant sticks:
+**Cursor stuck?** Hold `Ctrl + Shift + Alt + Cmd` together to get it back.
+
+## Check what it is doing
+
+On Linux:
 
 ```sh
-openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-  -keyout key.pem -out cert.pem -subj "/CN=Glide Self Signed/O=Glide" \
-  -addext "basicConstraints=critical,CA:false" \
-  -addext "keyUsage=critical,digitalSignature" \
-  -addext "extendedKeyUsage=critical,codeSigning"
-openssl pkcs12 -export -legacy -out glide.p12 -inkey key.pem -in cert.pem \
-  -passout pass:glide -name "Glide Self Signed"
-security import glide.p12 -k ~/Library/Keychains/login.keychain-db \
-  -T /usr/bin/codesign -P glide
+glide status            # ● 1.8ms  or  → mymac  or  ✕ offline
+glide status --json     # for waybar
 ```
 
-`contrib/bundle.sh` picks that certificate up on its own from then on. Keep the
-key somewhere safe: rebuild with a different certificate and the grants reset.
+On the Mac, the menu bar icon shows the same thing. For a waybar module, see
+[contrib/waybar-glide.md](contrib/waybar-glide.md).
 
-## Configuration
+## Tips
 
-```toml
-name = "mymac"
-role = "server"                # "server" shares this machine's keyboard and
-                               # mouse, "client" is driven by it. No default:
-                               # guessing it would hand control the wrong way.
-listen = "0.0.0.0:4242"
+- **macOS keeps asking for permissions after every rebuild?** macOS forgets
+  permissions when the app's signature changes. Sign it with a certificate,
+  even a self-signed one, and `contrib/bundle.sh` will use it. See the notes at
+  the top of that file.
+- **Images do not paste on Linux?** Another program reading the clipboard can
+  cancel it. Check for stray `wl-paste --watch` processes.
+- **Don't run lan-mouse at the same time.** It uses the same port and screen edges.
 
-[[peer]]
-name = "mybox"
-addrs = ["192.168.1.50:4242"]  # several are allowed: Ethernet, Wi-Fi, Tailscale
-position = "top"               # which edge of this machine the peer sits on
-display = 1                    # optional: which of this machine's displays owns
-                               # that edge, numbered as the Arrange window shows
-fingerprint = "8afca615..."    # from `glide fingerprint` on the other machine
-```
+## Contributing
 
-Every ten seconds each side logs the round trip to the other:
+![How to contribute](docs/images/contributing.svg)
 
-```
-INFO glide::link: rtt p50 2.37ms  p99 3.01ms  min 1.41ms  max 3.01ms  n=10 peer=mybox
-```
+1. Fork the repo on GitHub and clone your fork.
+2. Make a branch: `git checkout -b my-change`
+3. Make your change, then check it:
 
-### The layout here
+   ```sh
+   cargo build
+   cargo test
+   cargo clippy --all-targets
+   ```
 
-A worked example. `mymac` is the server, so its keyboard and mouse are the shared
-ones and it only runs while the app is open. `mybox` is the client, started by
-the Hyprland session. `mybox` sits on the top edge of Display 1, so that whole
-edge is the crossing.
+4. Commit with a short, simple message, for example `Fix cursor stuck at screen edge`.
+5. Push and open a pull request. Say what you changed and why.
 
-```
-              +--------------------+
-              |                    |     mybox — client
-              |       mybox        |     Arch, Hyprland
-              |     Display 1      |     typed on, never types back
-              |     1920 x 1080    |     starts with the session
-              |                    |
-              +====================+
-                        ^
-              the cursor crosses this whole edge
-              ( position = "top", display = 1 )
-                        v
-              +====================+
-              |                    |     mymac — server
-              |       mymac        |     macOS, owns the keyboard and mouse
-              |     Display 1      |     runs only while you have Glide open
-              |     1920 x 1243    |
-              |                    |
-              +--------------------+
-```
+Good first things to work on:
 
-The Arrange window draws this from the live displays on both machines. With more
-than one attached, `display = 1` picks which one owns the edge; the others are
-drawn but arm nothing.
+- Land the cursor at the same spot on the other screen
+- Swap Cmd and Super keys between macOS and Linux
+- Find the other machine on the network without typing its IP
 
-### Per-machine notes
+The diagrams are in `docs/images`. Open a `.excalidraw` file at
+[excalidraw.com](https://excalidraw.com), edit it, and export it as SVG with the
+same name.
 
-- **macOS** — the app bundle holds the daemon and the menu bar in one process.
-  Its menu shows who is connected and which way input is flowing, and opens a
-  window that draws both machines' real displays for arranging them. It starts
-  only when you open it.
-- **Hyprland** — `contrib/waybar-glide.md` has a waybar module and matching CSS.
-- **lan-mouse** — it holds the same port and grabs the same screen edges, so the
-  two cannot run together. Its XDG autostart entry has to go.
+## Credits
 
-## Seeing what it is doing
-
-The daemon keeps a few lines in `~/.cache/glide/status` — mode, peer, round trip —
-and rewrites them only when something changes. Anything can read it without
-touching the daemon:
-
-```sh
-glide status            # → ● 1.8ms   or   → mybox    or   ✕ offline
-glide status --json     # {"text":"● 1.8ms","tooltip":"...","class":"local"}
-glide status --watch    # keep printing, once a second
-```
-
-- **macOS** — the menu bar item in Glide.app reads it directly, in process. It
-  shows the app's badge, and its menu says who is connected, which way input is
-  flowing and the round trip.
-- **waybar** — point a custom module at the JSON:
-
-  ```jsonc
-  "custom/glide": { "exec": "glide status --json --icon --watch", "return-type": "json" }
-  ```
-
-  `--icon` prints the letter instead of words, so a stylesheet can draw the same
-  rounded-square badge the Mac shows.
-
-  The `class` field is `local`, `sending`, `receiving`, `offline` or `denied`, so
-  the badge can be coloured per state. `contrib/waybar-glide.md` has the
-  module and the CSS.
-
-## Clipboard
-
-Text and images, both directions, capped at 1 MB and 16 MB.
-
-Images cross as the bytes the clipboard already holds — `image/png`, `image/jpeg`
-or `image/gif` — rather than being decoded to pixels and re-encoded. A screenshot
-is PNG on both platforms already, so it arrives lossless and at its original size:
-a terminal screenshot is a few hundred kilobytes, where the same image as raw
-pixels would be eleven megabytes. That also keeps change detection cheap, since
-the daemon hashes compressed bytes once a second rather than a full bitmap.
-
-macOS reads and writes the pasteboard by UTI, Hyprland by MIME type, so neither
-side needs an image library.
-
-## Not done yet
-
-- **The cursor does not arrive at the matching spot.** Leave the top edge on the
-  left and you arrive wherever the other machine's cursor happened to be. The
-  input crates carry relative motion only; landing in the right place means
-  sending the crossing point and warping the remote cursor to it.
-- **Cmd and Super are not remapped.** Scancodes pass through as they are, so
-  shortcuts land as the other platform's keys.
-- **Latency is round trip only** — no capture-to-inject measurement, which needs
-  clock-offset estimation.
-- **No pixel-accurate offsets along an edge.** A barrier is a whole side of a
-  display, so two screens of different heights meet at whichever part overlaps.
-- Preferring the lowest-latency address when several are up; today the first to
-  answer wins.
-- mDNS discovery, and an arrange window on Linux — there, screens are arranged by
-  editing the config.
+- [Barrier](https://github.com/debauchee/barrier) for the idea of a server and a client.
+- [lan-mouse](https://github.com/feschber/lan-mouse) for the input capture and
+  emulation code glide is built on.
 
 ## License
 
-GPL-3.0, because the lan-mouse input crates are.
+GPL-3.0, the same as the lan-mouse code it uses.
