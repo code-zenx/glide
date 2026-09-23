@@ -206,28 +206,38 @@ fn read_image() -> Option<Clip> {
     None
 }
 
+/// Hand the bytes to `wl-copy` rather than serving them with wl-clipboard-rs:
+/// that crate destroys the whole offer the first time any reader hangs up
+/// early, and one always does — Walker's elephant runs `wl-paste --watch echo`,
+/// and `echo` never reads. An image under the 64 KiB pipe buffer survived that,
+/// so tiny screenshots crossed and real ones arrived as an empty clipboard.
+/// `wl-copy` serves each paste on its own and shrugs off a failed one. It forks
+/// into the background and stays until something else is copied.
 #[cfg(not(target_os = "macos"))]
 fn write_image(mime: &str, bytes: Vec<u8>) {
-    use wl_clipboard_rs::copy::{copy, MimeType, Options, Source};
+    use std::io::Write;
+    use std::process::{Command, Stdio};
 
-    // Serve the paste requests on a thread of our own, rather than letting
-    // `copy` spawn one: in foreground mode it reports why it stopped, where the
-    // spawned version throws that away, and it stopped immediately here without
-    // ever taking the selection. The thread lives until something else copies,
-    // which cancels the data source and ends the call.
-    let (mime, len) = (mime.to_string(), bytes.len());
-    std::thread::spawn(move || {
-        let mut options = Options::new();
-        options.foreground(true);
-        match copy(
-            options,
-            Source::Bytes(bytes.into_boxed_slice()),
-            MimeType::Specific(mime.clone()),
-        ) {
-            Ok(()) => debug!("{len} bytes of {mime} left the clipboard, replaced by another copy"),
-            Err(e) => debug!("cannot put {mime} on the clipboard: {e}"),
+    let child = Command::new("wl-copy")
+        .args(["--type", mime])
+        .stdin(Stdio::piped())
+        // The forked server inherits these; a pipe here would stay open for
+        // as long as the image sits on the clipboard.
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(e) => {
+            tracing::warn!("cannot run wl-copy for {mime}, is wl-clipboard installed? {e}");
+            return;
         }
-    });
+    };
+    let written = child.stdin.take().expect("stdin is piped").write_all(&bytes);
+    match (written, child.wait()) {
+        (Ok(()), Ok(status)) if status.success() => {}
+        (written, status) => tracing::warn!("wl-copy did not take {mime}: {written:?} {status:?}"),
+    }
 }
 
 #[cfg(test)]

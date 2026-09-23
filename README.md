@@ -27,7 +27,7 @@ Wayland, and lan-mouse has no clipboard sync, so glide does both.
 ## Requirements
 
 - A Mac with macOS 13 or newer (Apple Silicon for the download)
-- A Linux PC running Hyprland (Wayland)
+- A Linux PC running Hyprland (Wayland), with `wl-clipboard` installed for images
 - Both on the same network
 
 ## Download
