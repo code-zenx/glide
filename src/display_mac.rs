@@ -25,6 +25,10 @@ use objc2::rc::{Allocated, Retained};
 use objc2::runtime::{AnyClass, AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, AnyThread, DefinedClass};
 use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType, CGSize};
+use objc2_core_video::{
+    kCVImageBufferColorPrimaries_ITU_R_709_2, kCVImageBufferTransferFunction_ITU_R_709_2,
+    kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+};
 use objc2_core_media::{
     kCMSampleAttachmentKey_NotSync, kCMTimeInvalid, kCMVideoCodecType_HEVC, CMSampleBuffer, CMTime,
     CMVideoFormatDescriptionGetHEVCParameterSetAtIndex,
@@ -36,6 +40,8 @@ use objc2_screen_capture_kit::{
 };
 use objc2_video_toolbox::{
     kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
+    kVTCompressionPropertyKey_ColorPrimaries, kVTCompressionPropertyKey_TransferFunction,
+    kVTCompressionPropertyKey_YCbCrMatrix,
     kVTCompressionPropertyKey_ExpectedFrameRate, kVTCompressionPropertyKey_MaxFrameDelayCount,
     kVTCompressionPropertyKey_MaxKeyFrameInterval,
     kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kVTCompressionPropertyKey_ProfileLevel,
@@ -157,6 +163,9 @@ impl Running {
             config.setMinimumFrameInterval(CMTime::new(1, screen.hz as i32));
             config.setPixelFormat(PIXEL_FORMAT);
             config.setShowsCursor(true);
+            // Capture and stream both say BT.709, so the Mac's colours are
+            // what anorak draws instead of whatever its decoder guesses.
+            config.setColorMatrix(kCVImageBufferYCbCrMatrix_ITU_R_709_2);
         }
         let stream = unsafe { SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, None) };
         let sink = FrameSink::new(Sink { session: session.clone(), slot: slot.clone(), force_key: force_key() });
@@ -350,7 +359,7 @@ fn encoder(screen: ScreenMode, bitrate: u32, slot: &Arc<Slot>) -> Result<CFRetai
     let key_interval = CFNumber::new_i32(i32::MAX);
     let zero = CFNumber::new_i32(0);
     let profile: &CFType = unsafe { kVTProfileLevel_HEVC_Main_AutoLevel };
-    let properties: [(&CFString, &CFType); 8] = unsafe {
+    let properties: [(&CFString, &CFType); 11] = unsafe {
         [
             (kVTCompressionPropertyKey_RealTime, yes),
             (kVTCompressionPropertyKey_AllowFrameReordering, no),
@@ -360,6 +369,9 @@ fn encoder(screen: ScreenMode, bitrate: u32, slot: &Arc<Slot>) -> Result<CFRetai
             (kVTCompressionPropertyKey_MaxKeyFrameInterval, &key_interval),
             (kVTCompressionPropertyKey_MaxFrameDelayCount, &zero),
             (kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, yes),
+            (kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2),
+            (kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2),
+            (kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2),
         ]
     };
     for (key, value) in properties {
