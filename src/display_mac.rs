@@ -47,6 +47,8 @@ use objc2_video_toolbox::{
 
 use crate::display::{Frame, Slot};
 use crate::proto::ScreenMode;
+use crate::screens::Screen;
+use crate::Side;
 
 /// '420v': the encoder's own input format, so nothing converts in between.
 const PIXEL_FORMAT: u32 = u32::from_be_bytes(*b"420v");
@@ -60,6 +62,21 @@ const APPEAR_TIMEOUT: Duration = Duration::from_secs(5);
 unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGRequestScreenCaptureAccess() -> bool;
+    fn CGBeginDisplayConfiguration(config: *mut *mut c_void) -> i32;
+    fn CGConfigureDisplayOrigin(config: *mut c_void, display: u32, x: i32, y: i32) -> i32;
+    fn CGCompleteDisplayConfiguration(config: *mut c_void, option: u32) -> i32;
+}
+
+/// kCGConfigureForSession: kept until logout, never written to the user's
+/// saved arrangement.
+const FOR_SESSION: u32 = 1;
+
+/// Where the peer's screen sits: which edge, of which display (1-based, as the
+/// Arrange window numbers them), or of the whole desktop when none is named.
+#[derive(Clone, Copy, Debug)]
+pub struct Place {
+    pub side: Side,
+    pub display: Option<usize>,
 }
 
 /// A running extended display. Dropping it stops the capture and removes the
@@ -70,7 +87,7 @@ pub struct Capture {
 }
 
 impl Capture {
-    pub fn start(screen: ScreenMode, bitrate: u32, slot: Arc<Slot>) -> Result<Self> {
+    pub fn start(screen: ScreenMode, place: Place, bitrate: u32, slot: Arc<Slot>) -> Result<Self> {
         if !unsafe { CGPreflightScreenCaptureAccess() } {
             // Adds Glide to the Screen Recording list and asks, once.
             unsafe { CGRequestScreenCaptureAccess() };
@@ -79,7 +96,7 @@ impl Capture {
         let (ready, started) = mpsc::channel();
         let (stop, stopped) = mpsc::channel::<()>();
         let thread = std::thread::Builder::new().name("glide-display".into()).spawn(move || {
-            match Running::new(screen, bitrate, slot) {
+            match Running::new(screen, place, bitrate, slot) {
                 Ok(running) => {
                     let _ = ready.send(Ok(()));
                     let _ = stopped.recv();
@@ -120,9 +137,13 @@ struct Running {
 }
 
 impl Running {
-    fn new(screen: ScreenMode, bitrate: u32, slot: Arc<Slot>) -> Result<Self> {
+    fn new(screen: ScreenMode, place: Place, bitrate: u32, slot: Arc<Slot>) -> Result<Self> {
         let queue = DispatchQueue::new("dev.glide.display", DispatchQueueAttr::SERIAL);
         let (display, id) = virtual_display(screen, &queue)?;
+        // Misplaced is still usable, so a refusal here is logged, not fatal.
+        if let Err(e) = arrange(id, screen, place) {
+            tracing::warn!("cannot place the virtual display: {e}");
+        }
         let shared = shareable(id)?;
         let session = encoder(screen, bitrate, &slot)?;
 
@@ -216,6 +237,52 @@ fn virtual_display(screen: ScreenMode, queue: &DispatchQueue) -> Result<(Retaine
         }
         let id: u32 = msg_send![&display, displayID];
         Ok((display, id))
+    }
+}
+
+/// Put the virtual display where the Arrange window has the peer, so the
+/// cursor leaves through the same edge in Extend as in Control.
+fn arrange(id: u32, screen: ScreenMode, place: Place) -> Result<()> {
+    let screens = crate::screens::local();
+    let target = place
+        .display
+        .and_then(|n| screens.get(n.checked_sub(1)?).cloned())
+        .or_else(|| union(&screens))
+        .context("no real display to sit beside")?;
+    let (x, y) = beside(&target, screen.w as i32, screen.h as i32, place.side);
+    unsafe {
+        let mut config = null_mut();
+        if CGBeginDisplayConfiguration(&mut config) != 0 {
+            bail!("CGBeginDisplayConfiguration failed");
+        }
+        CGConfigureDisplayOrigin(config, id, x, y);
+        let status = CGCompleteDisplayConfiguration(config, FOR_SESSION);
+        if status != 0 {
+            bail!("macOS refused the arrangement (status {status})");
+        }
+    }
+    tracing::info!(x, y, side = ?place.side, display = ?place.display, "virtual display placed");
+    Ok(())
+}
+
+/// The box around every display: the whole desktop.
+fn union(screens: &[Screen]) -> Option<Screen> {
+    let left = screens.iter().map(|s| s.x).min()?;
+    let top = screens.iter().map(|s| s.y).min()?;
+    let right = screens.iter().map(|s| s.x + s.w as i32).max()?;
+    let bottom = screens.iter().map(|s| s.y + s.h as i32).max()?;
+    Some(Screen { name: String::new(), x: left, y: top, w: (right - left) as u32, h: (bottom - top) as u32 })
+}
+
+/// The origin of a `w`×`h` screen touching `target` along `side`, centred on
+/// that edge. macOS coordinates: y grows downward from the main display's top.
+fn beside(target: &Screen, w: i32, h: i32, side: Side) -> (i32, i32) {
+    let (tw, th) = (target.w as i32, target.h as i32);
+    match side {
+        Side::Top => (target.x + (tw - w) / 2, target.y - h),
+        Side::Bottom => (target.x + (tw - w) / 2, target.y + th),
+        Side::Left => (target.x - w, target.y + (th - h) / 2),
+        Side::Right => (target.x + tw, target.y + (th - h) / 2),
     }
 }
 
@@ -500,6 +567,27 @@ mod tests {
     }
 
     #[test]
+    fn the_virtual_display_sits_centred_on_the_chosen_edge() {
+        // Display 1 from the Arrange window: 2560×1080 at the origin.
+        let d1 = Screen { name: "Display 1".into(), x: 0, y: 0, w: 2560, h: 1080 };
+        assert_eq!(beside(&d1, 1920, 1080, Side::Top), (320, -1080));
+        assert_eq!(beside(&d1, 1920, 1080, Side::Bottom), (320, 1080));
+        assert_eq!(beside(&d1, 1920, 1080, Side::Left), (-1920, 0));
+        assert_eq!(beside(&d1, 1920, 1080, Side::Right), (2560, 0));
+    }
+
+    #[test]
+    fn no_display_named_means_the_whole_desktop() {
+        let screens = [
+            Screen { name: "a".into(), x: -1920, y: 0, w: 1920, h: 1080 },
+            Screen { name: "b".into(), x: 0, y: -200, w: 2560, h: 1440 },
+        ];
+        let all = union(&screens).unwrap();
+        assert_eq!((all.x, all.y, all.w, all.h), (-1920, -200, 4480, 1440));
+        assert!(union(&[]).is_none());
+    }
+
+    #[test]
     fn short_length_prefixes_work_too() {
         assert_eq!(to_annex_b(&[0, 1, 7], 2, &[]).unwrap(), [0, 0, 0, 1, 7]);
     }
@@ -533,7 +621,8 @@ mod tests {
     fn a_virtual_display_streams_hevc() {
         let slot = Arc::new(Slot::default());
         let screen = ScreenMode { w: 1920, h: 1080, hz: 60 };
-        let capture = Capture::start(screen, 20_000_000, slot.clone()).expect("start");
+        let place = Place { side: Side::Top, display: Some(1) };
+        let capture = Capture::start(screen, place, 20_000_000, slot.clone()).expect("start");
         let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         let frame = runtime
             .block_on(async { tokio::time::timeout(Duration::from_secs(5), slot.pop()).await })

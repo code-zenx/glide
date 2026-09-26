@@ -231,6 +231,7 @@ fn daemon(
         #[cfg(target_os = "macos")]
         tokio::spawn(display::host(
             config.display.clone(),
+            config_path.clone(),
             net.clone(),
             config.peers[0].clone(),
             links.clone(),
@@ -298,6 +299,13 @@ fn main() -> Result<()> {
     start_logging(matches!(cmd, Cmd::App));
     #[cfg(not(target_os = "macos"))]
     start_logging(false);
+    // A panic in a background task otherwise goes to stderr, which the app
+    // does not have: the task just stops, and nothing says why.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        tracing::error!("panic: {info}");
+        default_hook(info);
+    }));
 
     match &cmd {
         Cmd::Init { name, role } => {

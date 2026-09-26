@@ -33,7 +33,14 @@ impl Screen {
     }
 }
 
+/// The vendor number glide's own virtual display reports, so it can be told
+/// apart from a real monitor.
+#[cfg(target_os = "macos")]
+pub const GLIDE_VENDOR: u32 = 0x676c;
+
 /// The screens attached to this machine, left to right as the system sees them.
+/// Leaves out glide's own virtual display: it stands in for the peer's screen,
+/// and counting it would renumber the real displays the config refers to.
 #[cfg(target_os = "macos")]
 pub fn local() -> Vec<Screen> {
     use objc2_core_foundation::CGRect;
@@ -42,6 +49,7 @@ pub fn local() -> Vec<Screen> {
     unsafe extern "C" {
         fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
         fn CGDisplayBounds(display: u32) -> CGRect;
+        fn CGDisplayVendorNumber(display: u32) -> u32;
     }
 
     let mut ids = [0u32; 8];
@@ -51,6 +59,7 @@ pub fn local() -> Vec<Screen> {
     }
     ids.iter()
         .take(found as usize)
+        .filter(|&&id| unsafe { CGDisplayVendorNumber(id) } != GLIDE_VENDOR)
         .enumerate()
         .map(|(i, &id)| {
             let bounds = unsafe { CGDisplayBounds(id) };

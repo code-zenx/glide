@@ -261,8 +261,10 @@ impl Host {
 
 /// The server's side: owns the virtual display and streams it.
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 pub async fn host(
     settings: Settings,
+    config_path: std::path::PathBuf,
     net: crate::link::Net,
     peer: crate::Peer,
     links: Arc<crate::link::Links>,
@@ -284,6 +286,7 @@ pub async fn host(
                 None => break,
                 Some(Event::Mode(mode)) => host.mode(mode),
                 Some(Event::Link(name, up)) if name == peer.name => {
+                    tracing::debug!(peer = %name, up, "display sees the link");
                     if up { grace = None; }
                     host.link(up)
                 }
@@ -303,7 +306,10 @@ pub async fn host(
         };
         for step in steps {
             match step {
-                Step::Ask(show) => links.send(&peer.name, Msg::Display(show)),
+                Step::Ask(show) => {
+                    info!(peer = %peer.name, ?show, "asking the peer about the display");
+                    links.send(&peer.name, Msg::Display(show));
+                }
                 Step::StopLater => grace = Some(Box::pin(tokio::time::sleep(GRACE))),
                 Step::Stop => {
                     if let Some((capture, sender)) = running.take() {
@@ -317,7 +323,14 @@ pub async fn host(
                 }
                 Step::Start(screen) => {
                     let slot = Arc::new(Slot::default());
-                    match crate::display_mac::Capture::start(screen, bitrate, slot.clone()) {
+                    // Read now, not at startup: the Arrange window may have
+                    // moved the peer since.
+                    let at = crate::load(&config_path)
+                        .ok()
+                        .and_then(|c| c.peers.into_iter().find(|p| p.name == peer.name))
+                        .unwrap_or_else(|| peer.clone());
+                    let place = crate::display_mac::Place { side: at.position, display: at.display };
+                    match crate::display_mac::Capture::start(screen, place, bitrate, slot.clone()) {
                         Ok(capture) => {
                             info!(w = screen.w, h = screen.h, hz = screen.hz, "extended display on");
                             say(format!("Extended: {}×{} at {} Hz", screen.w, screen.h, screen.hz));
@@ -347,8 +360,14 @@ async fn stream(net: crate::link::Net, peer: crate::Peer, slot: Arc<Slot>) {
                 let sent = async {
                     let mut send = conn.open_uni().await?;
                     slot.restart();
+                    let mut count = 0u64;
                     loop {
-                        write_frame(&mut send, &slot.pop().await).await?;
+                        let frame = slot.pop().await;
+                        count += 1;
+                        if count == 1 || count.is_multiple_of(600) {
+                            tracing::info!(count, key = frame.key, bytes = frame.data.len(), "video frames sent");
+                        }
+                        write_frame(&mut send, &frame).await?;
                     }
                 };
                 let result: Result<()> = sent.await;
@@ -389,6 +408,7 @@ pub async fn show(
     while let Some(event) = events.recv().await {
         match event {
             Event::Msg(peer, Msg::Display(Show::On { workspace })) => {
+                info!(%peer, workspace, "asked to show the extended display");
                 let answer = Screen::prepare(workspace);
                 let reply = answer.as_ref().map(|s| s.mode).map_err(|e| e.to_string());
                 if let Err(why) = &reply {
@@ -420,8 +440,14 @@ pub async fn show(
                         let receiver = tokio::spawn(async move {
                             let result: Result<()> = async {
                                 let mut recv = conn.accept_uni().await?;
+                                let mut count = 0u64;
                                 loop {
-                                    feeding.push(read_frame(&mut recv).await?.data);
+                                    let frame = read_frame(&mut recv).await?;
+                                    count += 1;
+                                    if count == 1 || count.is_multiple_of(600) {
+                                        info!(count, key = frame.key, bytes = frame.data.len(), "video frames received");
+                                    }
+                                    feeding.push(frame.data);
                                 }
                             }
                             .await;

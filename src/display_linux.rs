@@ -82,6 +82,10 @@ fn dispatch(workspace: &str) {
 /// Decodes and shows frames as fast as they come: a live source, no queues,
 /// and a sink that draws each frame the moment it is decoded instead of
 /// waiting for a clock.
+///
+/// `vapostproc` is not optional: `vah265dec` and `waylandsink` share no buffer
+/// format on the UHD 630, and without it the pipeline stops at the first frame
+/// with `not-negotiated`. It converts on the GPU, so nothing is copied.
 pub struct Player {
     pipeline: gst::Pipeline,
     src: gst_app::AppSrc,
@@ -94,7 +98,7 @@ impl Player {
         let description = format!(
             "appsrc name=src is-live=true format=time do-timestamp=true \
                caps=video/x-h265,stream-format=byte-stream,alignment=au \
-             ! h265parse ! {DECODER} \
+             ! h265parse ! {DECODER} ! vapostproc \
              ! waylandsink sync=false fullscreen=true {fullscreen_on}"
         );
         let pipeline = gst::parse::launch(&description)?
@@ -105,6 +109,7 @@ impl Player {
             .context("no appsrc")?
             .downcast::<gst_app::AppSrc>()
             .map_err(|_| anyhow::anyhow!("not an appsrc"))?;
+        watch(&pipeline);
         pipeline.set_state(gst::State::Playing)?;
         Ok(Self { pipeline, src })
     }
@@ -114,6 +119,26 @@ impl Player {
             tracing::debug!("decoder refused a frame: {e}");
         }
     }
+}
+
+/// GStreamer reports trouble on its bus, not through return values; without
+/// this a decoder that refuses the stream fails in silence.
+fn watch(pipeline: &gst::Pipeline) {
+    let Some(bus) = pipeline.bus() else { return };
+    std::thread::spawn(move || {
+        for msg in bus.iter_timed(gst::ClockTime::NONE) {
+            match msg.view() {
+                gst::MessageView::Error(e) => {
+                    tracing::warn!("video pipeline error from {:?}: {} ({:?})", e.src().map(|s| s.path_string()), e.error(), e.debug());
+                }
+                gst::MessageView::Warning(w) => {
+                    tracing::warn!("video pipeline warning from {:?}: {} ({:?})", w.src().map(|s| s.path_string()), w.error(), w.debug());
+                }
+                gst::MessageView::Eos(_) => break,
+                _ => {}
+            }
+        }
+    });
 }
 
 impl Drop for Player {
