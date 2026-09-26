@@ -22,10 +22,11 @@ use input_event::{Event, KeyboardEvent};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{debug, info, warn};
 
+use crate::display::{self, Mode as DisplayMode};
 use crate::link::Links;
 use crate::proto::Msg;
 use crate::status::Status;
-use crate::{Config, Role, Side};
+use crate::{Config, Peer, Role, Side};
 
 /// Held together, these hand input back to this machine even if the peer never
 /// answers again — the way out of a wedged remote session.
@@ -121,6 +122,14 @@ impl Handover {
         self.mode = Mode::Sending(handle);
     }
 
+    /// The peer this machine is driving, if any.
+    fn sending(&self) -> Option<CaptureHandle> {
+        match self.mode {
+            Mode::Sending(handle) => Some(handle),
+            _ => None,
+        }
+    }
+
     fn forwarding(&self, handle: CaptureHandle) -> bool {
         self.mode == Mode::Sending(handle)
     }
@@ -185,16 +194,38 @@ pub enum Control {
     SetPosition(CaptureHandle, Side, Option<usize>),
     /// Try the input backends again, after permission was granted.
     RetryBackends,
+    /// Switch between driving the peer and extending this screen onto it.
+    SetMode(DisplayMode),
 }
 
+/// Whether a peer's screen edge should be armed: only with a live link behind
+/// it, and never while the peer is showing our extended display — the cursor
+/// then belongs on the virtual screen, not in the peer.
+fn edge_wanted(linked: bool, extending: bool) -> bool {
+    linked && !extending
+}
+
+async fn set_edge(capture: &mut InputCapture, handle: usize, peer: &Peer, on: bool) -> Result<()> {
+    if on {
+        // A display numbered for people is 1-based; the backend counts from 0.
+        capture.restrict_to_display(peer.display.map(|d| d.saturating_sub(1))).await;
+        capture.create(handle as CaptureHandle, peer.position.into()).await?;
+    } else {
+        capture.destroy(handle as CaptureHandle).await?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn session(
-    config: Config,
+    mut config: Config,
     config_path: std::path::PathBuf,
     links: Arc<Links>,
     status: Arc<Status>,
     mut from_links: UnboundedReceiver<(String, Msg)>,
     mut link_state: UnboundedReceiver<(String, bool)>,
     mut control: UnboundedReceiver<Control>,
+    display: tokio::sync::mpsc::UnboundedSender<display::Event>,
 ) -> Result<()> {
     let names: Vec<String> = config.peers.iter().map(|p| p.name.clone()).collect();
     let server = config.role == Role::Server;
@@ -210,6 +241,9 @@ pub async fn session(
     // behind it grabs the cursor and feeds it to nobody, and with the peer
     // above this screen that is every trip to the menu bar.
     let mut armed = vec![false; config.peers.len()];
+    let mut linked = vec![false; config.peers.len()];
+    // Only a server has a display to extend.
+    let mut extending = server && config.display.mode == DisplayMode::Extend;
     for i in 0..config.peers.len() {
         if let Some(emulation) = emulation.as_mut() {
             emulation.create(i as CaptureHandle).await;
@@ -303,26 +337,52 @@ pub async fn session(
             },
             change = link_state.recv() => {
                 let Some((peer, up)) = change else { break };
+                let _ = display.send(display::Event::Link(peer.clone(), up));
                 let Some(handle) = names.iter().position(|n| *n == peer) else { continue };
+                linked[handle] = up;
                 let Some(capture) = capture.as_mut() else { continue };
-                if up == armed[handle] {
+                let want = edge_wanted(up, extending);
+                if want == armed[handle] {
                     continue;
                 }
-                armed[handle] = up;
+                armed[handle] = want;
                 let at = &config.peers[handle];
-                if up {
-                    // A display numbered for people is 1-based; the backend counts from 0.
-                    capture.restrict_to_display(at.display.map(|d| d.saturating_sub(1))).await;
-                    capture.create(handle as CaptureHandle, at.position.into()).await?;
+                set_edge(capture, handle, at, want).await?;
+                if want {
                     let purpose = if server { "to send from" } else { "to hand control back" };
                     info!(%peer, side = ?at.position, display = ?at.display, "screen edge armed {purpose}");
                 } else {
-                    capture.destroy(handle as CaptureHandle).await?;
                     info!(%peer, "link down, screen edge dropped");
                 }
             },
             asked = control.recv() => {
                 let Some(asked) = asked else { break };
+                if let Control::SetMode(mode) = asked {
+                    extending = server && mode == DisplayMode::Extend;
+                    info!(?mode, "display mode");
+                    if let Err(e) = crate::set_display_mode(&config_path, mode) {
+                        warn!("cannot save the display mode: {e}");
+                    }
+                    let _ = display.send(display::Event::Mode(mode));
+                    // Extending while the cursor is in the peer: bring it home
+                    // first, or it stays there with its edge gone.
+                    if let Some(handle) = handover.sending().filter(|_| extending) {
+                        links.send(&names[handle as usize], Msg::Leave);
+                        handover.take_back();
+                        release(capture.as_mut()).await?;
+                    }
+                    if let Some(capture) = capture.as_mut() {
+                        for (i, peer) in config.peers.iter().enumerate() {
+                            let want = edge_wanted(linked[i], extending);
+                            if want != armed[i] {
+                                armed[i] = want;
+                                set_edge(capture, i, peer, want).await?;
+                            }
+                        }
+                    }
+                    publish(&handover, degraded, &mut shown);
+                    continue;
+                }
                 let Control::SetPosition(handle, side, on_display) = asked else {
                     // RetryBackends: permission may have just been granted, so
                     // build whichever backend this machine's role needs.
@@ -333,10 +393,7 @@ pub async fn session(
                                 if !armed[i] {
                                     continue;
                                 }
-                                capture
-                                    .restrict_to_display(peer.display.map(|d| d.saturating_sub(1)))
-                                    .await;
-                                capture.create(i as CaptureHandle, peer.position.into()).await?;
+                                set_edge(capture, i, peer, true).await?;
                             }
                             info!("input capture is working now");
                         }
@@ -355,6 +412,10 @@ pub async fn session(
                     continue;
                 };
                 let Some(peer) = names.get(handle as usize) else { continue };
+                // Kept current, so re-arming later puts the edge where it is
+                // now rather than where it was at startup.
+                config.peers[handle as usize].position = side;
+                config.peers[handle as usize].display = on_display;
                 // Re-arm the edge: the capture backend keys a grab to a screen
                 // side, so moving the peer means dropping it and taking a new one.
                 if let Some(capture) = capture.as_mut().filter(|_| armed[handle as usize]) {
@@ -417,6 +478,7 @@ pub async fn session(
                         if let Err(e) = crate::set_peer_side(&config_path, &peer, side) {
                             warn!(%peer, "cannot save the arrangement: {e}");
                         }
+                        config.peers[handle as usize].position = side;
                         if let Some(capture) = capture.as_mut().filter(|_| armed[handle as usize]) {
                             capture.destroy(handle).await?;
                             capture.create(handle, side.into()).await?;
@@ -425,6 +487,9 @@ pub async fn session(
                     Msg::Screens(screens) => {
                         info!(%peer, count = screens.len(), "peer described its screens");
                         status.set_screens(&peer, screens);
+                    }
+                    Msg::Display(_) | Msg::DisplayReady(_) => {
+                        let _ = display.send(display::Event::Msg(peer, msg));
                     }
                     Msg::Ping(_) | Msg::Pong(_) => {}
                 }
@@ -569,6 +634,26 @@ mod tests {
             Crossing::HandBack,
             "and it stays the way back even with the link down"
         );
+    }
+
+    /// Extending must take the edge away, or the cursor leaves for the peer
+    /// instead of walking onto the virtual display beside it.
+    #[test]
+    fn extending_disarms_the_edge() {
+        assert!(edge_wanted(true, false));
+        assert!(!edge_wanted(true, true), "extended: the edge must be gone");
+        assert!(!edge_wanted(false, false), "no link: no edge");
+        assert!(!edge_wanted(false, true));
+    }
+
+    #[test]
+    fn extending_knows_who_has_the_cursor() {
+        let mut h = Handover::new(false);
+        assert_eq!(h.sending(), None);
+        h.began(3);
+        assert_eq!(h.sending(), Some(3));
+        h.take_back();
+        assert_eq!(h.sending(), None);
     }
 
     /// The whole point of the roles: a server's keyboard and mouse are shared

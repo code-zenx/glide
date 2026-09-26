@@ -34,6 +34,29 @@ pub enum Msg {
     /// "You are on this side of me" — sent when one end is rearranged, so both
     /// ends agree which edges face each other.
     Arrange(Side),
+    /// The server's extended display: show it on workspace N, or stop. Only a
+    /// server sends this; the client obeys and decides nothing.
+    Display(Show),
+    /// The client's answer to `Display(Show::On)`: the mode of the screen it
+    /// will show the display on, or why it cannot.
+    DisplayReady(Result<ScreenMode, String>),
+}
+
+/// What the server asks a client's screen to do with its extended display.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum Show {
+    Off,
+    /// Switch to this workspace and show the display there, fullscreen.
+    On { workspace: u8 },
+}
+
+/// A client monitor's pixels and refresh rate. The server makes its virtual
+/// display exactly this, so nothing is scaled on either end.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub struct ScreenMode {
+    pub w: u32,
+    pub h: u32,
+    pub hz: u32,
 }
 
 /// Which of the connection's three channels a message belongs on.
@@ -93,6 +116,21 @@ impl Msg {
                     Side::Bottom => 3,
                 });
             }
+            Msg::Display(Show::Off) => out.push(9),
+            Msg::Display(Show::On { workspace }) => {
+                out.push(10);
+                out.push(*workspace);
+            }
+            Msg::DisplayReady(Ok(ScreenMode { w, h, hz })) => {
+                out.push(11);
+                for n in [w, h, hz] {
+                    out.extend_from_slice(&n.to_le_bytes());
+                }
+            }
+            Msg::DisplayReady(Err(why)) => {
+                out.push(12);
+                out.extend_from_slice(why.as_bytes());
+            }
             Msg::Screens(screens) => {
                 out.push(6);
                 out.push(screens.len().min(u8::MAX as usize) as u8);
@@ -138,6 +176,14 @@ impl Msg {
                 3 => Side::Bottom,
                 other => bail!("unknown side {other}"),
             }),
+            9 => Msg::Display(Show::Off),
+            10 => Msg::Display(Show::On { workspace: *rest.first().context("no workspace")? }),
+            11 => Msg::DisplayReady(Ok(ScreenMode {
+                w: u32_at(rest, 0)?,
+                h: u32_at(rest, 4)?,
+                hz: u32_at(rest, 8)?,
+            })),
+            12 => Msg::DisplayReady(Err(String::from_utf8_lossy(rest).into_owned())),
             _ => bail!("unknown message tag {tag}"),
         })
     }
@@ -258,6 +304,10 @@ mod tests {
             Msg::Screens(vec![]),
             Msg::Arrange(Side::Left),
             Msg::Arrange(Side::Bottom),
+            Msg::Display(Show::Off),
+            Msg::Display(Show::On { workspace: 9 }),
+            Msg::DisplayReady(Ok(ScreenMode { w: 1920, h: 1080, hz: 120 })),
+            Msg::DisplayReady(Err("install gst-plugin-va".into())),
             Msg::Input(Event::Pointer(PointerEvent::Motion { time: 7, dx: -1.5, dy: 2.25 })),
             Msg::Input(Event::Pointer(PointerEvent::Button { time: 8, button: 0x110, state: 1 })),
             Msg::Input(Event::Pointer(PointerEvent::Axis { time: 9, axis: 1, value: -3.5 })),
@@ -284,6 +334,8 @@ mod tests {
         assert_eq!(Msg::Input(key).route(), Route::Stream);
         assert_eq!(Msg::Enter.route(), Route::Stream);
         assert_eq!(Msg::Arrange(Side::Left).route(), Route::Stream);
+        // Must arrive, and tiny: the video itself has a connection of its own.
+        assert_eq!(Msg::Display(Show::On { workspace: 9 }).route(), Route::Stream);
         // Both kinds of clipboard, because text can be a megabyte too.
         assert_eq!(Msg::Clipboard(Clip::Text(String::new())).route(), Route::Bulk);
         let image = Clip::Image { mime: "image/png".into(), bytes: vec![0; 8] };
@@ -296,6 +348,6 @@ mod tests {
         for len in 0..full.len() {
             assert!(Msg::decode(&full[..len]).is_err(), "accepted {len} bytes");
         }
-        assert!(Msg::decode(&[9, 9, 9]).is_err());
+        assert!(Msg::decode(&[99, 9, 9]).is_err(), "an unknown tag");
     }
 }

@@ -14,7 +14,7 @@ use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::{define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuItem, NSStatusBar,
+    NSApplication, NSControlStateValueOff, NSControlStateValueOn, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuItem, NSStatusBar,
     NSVariableStatusItemLength, NSWindow, NSWorkspace,
 };
 use objc2_foundation::{
@@ -23,6 +23,7 @@ use objc2_foundation::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::display::Mode;
 use crate::input::Control;
 use crate::status::Status;
 use crate::Side;
@@ -39,6 +40,8 @@ pub struct Ivars {
     peer_name: String,
     side: std::cell::Cell<Side>,
     display: std::cell::Cell<Option<usize>>,
+    /// The Control / Extend pair, ticked to match the current mode.
+    modes: RefCell<Vec<(Mode, Retained<NSMenuItem>)>>,
     /// Kept alive so the window survives being closed and reopened.
     window: RefCell<Option<Retained<NSWindow>>>,
 }
@@ -78,6 +81,16 @@ define_class!(
             let _ = self.ivars().control.send(Control::RetryBackends);
         }
 
+        #[unsafe(method(controlMode:))]
+        fn control_mode(&self, _sender: &NSMenuItem) {
+            self.set_mode(Mode::Control);
+        }
+
+        #[unsafe(method(extendMode:))]
+        fn extend_mode(&self, _sender: &NSMenuItem) {
+            self.set_mode(Mode::Extend);
+        }
+
         #[unsafe(method(quit:))]
         fn quit(&self, _sender: &NSMenuItem) {
             if let Some(mtm) = MainThreadMarker::new() {
@@ -91,6 +104,17 @@ impl MenuTarget {
     fn new(ivars: Ivars) -> Retained<Self> {
         let this = Self::alloc().set_ivars(ivars);
         unsafe { msg_send![super(this), init] }
+    }
+
+    fn set_mode(&self, mode: Mode) {
+        let _ = self.ivars().control.send(Control::SetMode(mode));
+        tick(&self.ivars().modes.borrow(), mode);
+    }
+}
+
+fn tick(items: &[(Mode, Retained<NSMenuItem>)], mode: Mode) {
+    for (item_mode, item) in items {
+        item.setState(if *item_mode == mode { NSControlStateValueOn } else { NSControlStateValueOff });
     }
 }
 
@@ -215,6 +239,7 @@ pub fn run(
     current: Side,
     display: Option<usize>,
     peer_name: String,
+    mode: Mode,
 ) -> Result<()> {
     let mtm = MainThreadMarker::new().context("the menu bar must run on the main thread")?;
     let app = NSApplication::sharedApplication(mtm);
@@ -228,6 +253,7 @@ pub fn run(
         peer_name: peer_name.clone(),
         side: std::cell::Cell::new(current),
         display: std::cell::Cell::new(display),
+        modes: RefCell::new(Vec::new()),
         window: RefCell::new(None),
     });
 
@@ -241,6 +267,20 @@ pub fn run(
     for line in [&who, &flow, &speed] {
         menu.addItem(line);
     }
+
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    // Drive the peer, or use its monitor as another screen for this Mac.
+    let modes = vec![
+        (Mode::Control, command(mtm, &format!("Control {peer_name}"), sel!(controlMode:), "", &target)),
+        (Mode::Extend, command(mtm, &format!("Extend to {peer_name}"), sel!(extendMode:), "", &target)),
+    ];
+    for (_, item) in &modes {
+        menu.addItem(item);
+    }
+    tick(&modes, mode);
+    *target.ivars().modes.borrow_mut() = modes;
+    let shown = note(mtm, "");
+    menu.addItem(&shown);
 
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     // Arranging screens is the window's job; four compass items said the same
@@ -267,6 +307,8 @@ pub fn run(
         speed.setTitle(&NSString::from_str(&state.speed()));
         // The permission item only makes sense while something is refused.
         grant.setHidden(!state.denied);
+        shown.setTitle(&NSString::from_str(&state.display));
+        shown.setHidden(state.display.is_empty());
         button.setToolTip(Some(&NSString::from_str(&state.tooltip())));
     };
     redraw();

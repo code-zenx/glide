@@ -19,11 +19,13 @@ pub struct State {
     /// This machine cannot capture or type. Kept apart from `mode` because a
     /// link that drops and reconnects must not erase a permission problem.
     pub denied: bool,
+    /// What the extended display is doing, in words; empty when it is off.
+    pub display: String,
 }
 
 impl Default for State {
     fn default() -> Self {
-        Self { peer: String::new(), mode: "offline".into(), rtt_ms: None, denied: false }
+        Self { peer: String::new(), mode: "offline".into(), rtt_ms: None, denied: false, display: String::new() }
     }
 }
 
@@ -113,8 +115,12 @@ impl State {
     fn encode(&self) -> String {
         let rtt = self.rtt_ms.map_or(String::new(), |r| format!("{r:.3}"));
         format!(
-            "mode={}\npeer={}\nrtt_ms={}\ndenied={}\n",
-            self.mode, self.peer, rtt, self.denied
+            "mode={}\npeer={}\nrtt_ms={}\ndenied={}\ndisplay={}\n",
+            self.mode,
+            self.peer,
+            rtt,
+            self.denied,
+            self.display.replace('\n', " ")
         )
     }
 
@@ -126,6 +132,7 @@ impl State {
                 "peer" => state.peer = value.to_string(),
                 "rtt_ms" => state.rtt_ms = value.parse().ok(),
                 "denied" => state.denied = value == "true",
+                "display" => state.display = value.to_string(),
                 _ => {}
             }
         }
@@ -232,7 +239,7 @@ mod tests {
     #[test]
     fn survives_a_round_trip() {
         let state =
-            State { peer: "mybox".into(), mode: "sending".into(), rtt_ms: Some(1.844), denied: true };
+            State { peer: "mybox".into(), mode: "sending".into(), rtt_ms: Some(1.844), denied: true, display: "Extended: 1920×1080 at 120 Hz".into() };
         assert_eq!(State::decode(&state.encode()), state);
     }
 
@@ -250,6 +257,7 @@ mod tests {
             mode: "sending".into(),
             rtt_ms: None,
             denied: false,
+            display: String::new(),
         };
         let json = state.json(false);
         assert!(json.contains(r#"an\"ora\\k"#), "{json}");
@@ -259,7 +267,7 @@ mod tests {
     #[test]
     fn summaries_say_which_way_input_is_going() {
         let mut state =
-            State { peer: "mybox".into(), mode: "local".into(), rtt_ms: Some(1.84), denied: false };
+            State { peer: "mybox".into(), mode: "local".into(), rtt_ms: Some(1.84), denied: false, display: String::new() };
         assert_eq!(state.summary(), "● 1.8ms");
         state.mode = "sending".into();
         assert_eq!(state.summary(), "→ mybox");
@@ -272,7 +280,7 @@ mod tests {
     #[test]
     fn the_badge_is_just_the_letter() {
         let state =
-            State { peer: "mybox".into(), mode: "sending".into(), rtt_ms: Some(2.0), denied: false };
+            State { peer: "mybox".into(), mode: "sending".into(), rtt_ms: Some(2.0), denied: false, display: String::new() };
         assert!(state.json(true).contains(r#""text":"G""#), "{}", state.json(true));
         assert!(state.json(false).contains("mybox"), "{}", state.json(false));
         // A denied machine says so through the class, whatever the mode is.
@@ -283,7 +291,7 @@ mod tests {
     #[test]
     fn a_reconnect_cannot_erase_a_permission_problem() {
         let mut state =
-            State { peer: "mybox".into(), mode: "local".into(), rtt_ms: Some(1.8), denied: true };
+            State { peer: "mybox".into(), mode: "local".into(), rtt_ms: Some(1.8), denied: true, display: String::new() };
         assert_eq!(state.summary(), "⚠ needs permission");
         // The link dropping and coming back only ever touches `mode`.
         state.mode = "offline".into();

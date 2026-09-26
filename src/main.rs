@@ -1,4 +1,9 @@
 mod clipboard;
+mod display;
+#[cfg(not(target_os = "macos"))]
+mod display_linux;
+#[cfg(target_os = "macos")]
+mod display_mac;
 mod input;
 mod link;
 #[cfg(target_os = "macos")]
@@ -90,6 +95,9 @@ pub struct Config {
     /// Address to listen on
     #[serde(default = "default_listen")]
     pub listen: SocketAddr,
+    /// The extended display. Only a server's is read: the client is told.
+    #[serde(default)]
+    pub display: display::Settings,
     #[serde(default, rename = "peer")]
     pub peers: Vec<Peer>,
 }
@@ -182,6 +190,14 @@ pub fn set_peer_side(path: &Path, peer_name: &str, side: Side) -> Result<()> {
     Ok(())
 }
 
+/// Remember the display mode, so the app comes back in it after a restart.
+pub fn set_display_mode(path: &Path, mode: display::Mode) -> Result<()> {
+    let mut config = load(path)?;
+    config.display.mode = mode;
+    std::fs::write(path, toml::to_string_pretty(&config)?)?;
+    Ok(())
+}
+
 /// Everything except the user interface: the link, the input session and the
 /// clipboard watcher, run until something gives out.
 fn daemon(
@@ -202,16 +218,38 @@ fn daemon(
         let (link_up, link_state) = tokio::sync::mpsc::unbounded_channel();
         let peers = config.peers.iter().map(|p| p.name.clone()).collect();
         tokio::spawn(clipboard::watch(links.clone(), peers));
+        let net = link::endpoint(&config, &identity)?;
+        let (to_display, display_events) = tokio::sync::mpsc::unbounded_channel();
+        // Video connections the peer opens to us, handed to the display side.
+        let (video_in, mut videos) = tokio::sync::mpsc::unbounded_channel();
+        let forward = to_display.clone();
+        tokio::spawn(async move {
+            while let Some((peer, conn)) = videos.recv().await {
+                let _ = forward.send(display::Event::Video(peer, conn));
+            }
+        });
+        #[cfg(target_os = "macos")]
+        tokio::spawn(display::host(
+            config.display.clone(),
+            net.clone(),
+            config.peers[0].clone(),
+            links.clone(),
+            status.clone(),
+            display_events,
+        ));
+        #[cfg(not(target_os = "macos"))]
+        tokio::spawn(display::show(links.clone(), status.clone(), display_events));
         let network = tokio::spawn(link::run(
             config.clone(),
-            identity,
+            net,
             links.clone(),
             status.clone(),
             to_session,
             link_up,
+            video_in,
         ));
         tokio::select! {
-            result = input::session(config, config_path, links, status, from_links, link_state, control) => result,
+            result = input::session(config, config_path, links, status, from_links, link_state, control, to_display) => result,
             result = network => result?,
             _ = tokio::signal::ctrl_c() => Ok(()),
         }
@@ -268,7 +306,13 @@ fn main() -> Result<()> {
             }
             let identity = link::Identity::load_or_create(&config_dir())?;
             let config =
-                Config { name: name.clone(), role: *role, listen: default_listen(), peers: vec![] };
+                Config {
+                    name: name.clone(),
+                    role: *role,
+                    listen: default_listen(),
+                    display: display::Settings::default(),
+                    peers: vec![],
+                };
             std::fs::create_dir_all(path.parent().unwrap())?;
             std::fs::write(&path, toml::to_string_pretty(&config)?)?;
             println!("wrote {}", path.display());
@@ -329,6 +373,7 @@ fn main() -> Result<()> {
             let config = load(&path)?;
             let peer = config.peers.first().context("no peers in the config")?;
             let (position, name, display) = (peer.position, peer.name.clone(), peer.display);
+            let mode = config.display.mode;
             let identity = link::Identity::load_or_create(&config_dir())?;
             let status = Arc::new(status::Status::default());
             status.offline(&name);
@@ -341,7 +386,7 @@ fn main() -> Result<()> {
                 }
             });
             // AppKit owns the main thread from here.
-            menubar::run(status, control_tx, path, position, display, name)?;
+            menubar::run(status, control_tx, path, position, display, name, mode)?;
         }
     }
     Ok(())

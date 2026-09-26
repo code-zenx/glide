@@ -34,6 +34,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Reads and writes the clipboard by MIME type, so an image crosses as the bytes
 # it already is instead of a decoded bitmap.
 wl-clipboard-rs = "0.9"
+# The receiving end of an extended display: hardware decode straight to a
+# Wayland surface, no copies through this process.
+gstreamer = "0.25"
+gstreamer-app = "0.25"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
@@ -41,6 +45,13 @@ objc2 = "0.6"
 objc2-app-kit = "0.3"
 objc2-core-foundation = "0.3"
 objc2-foundation = "0.3"
+# The sending end of an extended display: a virtual screen, captured without
+# copies and encoded on the media engine.
+dispatch2 = "0.3"
+objc2-core-media = "0.3"
+objc2-core-video = "0.3"
+objc2-screen-capture-kit = "0.3"
+objc2-video-toolbox = "0.3"
 
 [profile.release]
 # A small, quick binary matters more here than fast rebuilds: this runs all day.
