@@ -50,6 +50,14 @@ pub struct Settings {
     pub workspace: u8,
     #[serde(default = "default_bitrate")]
     pub bitrate_mbps: u32,
+    /// Offer Retina modes on the virtual display. The stream stays at the
+    /// client's pixels either way; HiDPI only changes what macOS draws.
+    #[serde(default = "default_hidpi")]
+    pub hidpi: bool,
+}
+
+fn default_hidpi() -> bool {
+    true
 }
 
 fn default_workspace() -> u8 {
@@ -62,7 +70,12 @@ fn default_bitrate() -> u32 {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { mode: Mode::Control, workspace: default_workspace(), bitrate_mbps: default_bitrate() }
+        Self {
+            mode: Mode::Control,
+            workspace: default_workspace(),
+            bitrate_mbps: default_bitrate(),
+            hidpi: default_hidpi(),
+        }
     }
 }
 
@@ -330,7 +343,7 @@ pub async fn host(
                         .and_then(|c| c.peers.into_iter().find(|p| p.name == peer.name))
                         .unwrap_or_else(|| peer.clone());
                     let place = crate::display_mac::Place { side: at.position, display: at.display };
-                    match crate::display_mac::Capture::start(screen, place, bitrate, slot.clone()) {
+                    match crate::display_mac::Capture::start(screen, place, settings.hidpi, bitrate, slot.clone()) {
                         Ok(capture) => {
                             info!(w = screen.w, h = screen.h, hz = screen.hz, "extended display on");
                             say(format!("Extended: {}×{} at {} Hz", screen.w, screen.h, screen.hz));

@@ -93,7 +93,7 @@ pub struct Capture {
 }
 
 impl Capture {
-    pub fn start(screen: ScreenMode, place: Place, bitrate: u32, slot: Arc<Slot>) -> Result<Self> {
+    pub fn start(screen: ScreenMode, place: Place, hidpi: bool, bitrate: u32, slot: Arc<Slot>) -> Result<Self> {
         if !unsafe { CGPreflightScreenCaptureAccess() } {
             // Adds Glide to the Screen Recording list and asks, once.
             unsafe { CGRequestScreenCaptureAccess() };
@@ -102,7 +102,7 @@ impl Capture {
         let (ready, started) = mpsc::channel();
         let (stop, stopped) = mpsc::channel::<()>();
         let thread = std::thread::Builder::new().name("glide-display".into()).spawn(move || {
-            match Running::new(screen, place, bitrate, slot) {
+            match Running::new(screen, place, hidpi, bitrate, slot) {
                 Ok(running) => {
                     let _ = ready.send(Ok(()));
                     let _ = stopped.recv();
@@ -143,10 +143,15 @@ struct Running {
 }
 
 impl Running {
-    fn new(screen: ScreenMode, place: Place, bitrate: u32, slot: Arc<Slot>) -> Result<Self> {
+    fn new(screen: ScreenMode, place: Place, hidpi: bool, bitrate: u32, slot: Arc<Slot>) -> Result<Self> {
         let queue = DispatchQueue::new("dev.glide.display", DispatchQueueAttr::SERIAL);
-        let (display, id) = virtual_display(screen, &queue)?;
-        // Misplaced is still usable, so a refusal here is logged, not fatal.
+        let (display, id) = virtual_display(screen, hidpi, &queue)?;
+        // Blurrier or misplaced is still usable, so these are logged, not fatal.
+        if hidpi {
+            if let Err(e) = unsafe { use_hidpi(id, screen) } {
+                tracing::warn!("cannot switch the virtual display to HiDPI: {e}");
+            }
+        }
         if let Err(e) = arrange(id, screen, place) {
             tracing::warn!("cannot place the virtual display: {e}");
         }
@@ -158,6 +163,8 @@ impl Running {
         };
         let config = unsafe { SCStreamConfiguration::new() };
         unsafe {
+            // Always the client's pixels. In a HiDPI mode macOS draws more
+            // than that, and ScreenCaptureKit scales it down on the GPU.
             config.setWidth(screen.w as usize);
             config.setHeight(screen.h as usize);
             config.setMinimumFrameInterval(CMTime::new(1, screen.hz as i32));
@@ -210,14 +217,34 @@ fn class(name: &CStr) -> Result<&'static AnyClass> {
     AnyClass::get(name).with_context(|| format!("{name:?} is missing from this macOS"))
 }
 
-/// A screen macOS believes is plugged in, at exactly the client's mode.
-fn virtual_display(screen: ScreenMode, queue: &DispatchQueue) -> Result<(Retained<AnyObject>, u32)> {
+/// How much larger than the client's monitor each offered mode is drawn. In
+/// HiDPI, 2× reads as "looks like" the monitor's own size at Retina
+/// sharpness, and the smaller steps give bigger text; 1× is plain pixels.
+const HIDPI_SCALES: [f64; 4] = [2.0, 5.0 / 3.0, 4.0 / 3.0, 1.0];
+
+/// The pixel sizes the virtual display offers, largest (the default) first.
+/// Kept even: encoders and scalers dislike odd sizes.
+fn modes(screen: ScreenMode, hidpi: bool) -> Vec<(u32, u32)> {
+    let scales: &[f64] = if hidpi { &HIDPI_SCALES } else { &[1.0] };
+    scales
+        .iter()
+        .map(|s| {
+            let even = |n: u32| ((n as f64 * s).round() as u32) & !1;
+            (even(screen.w), even(screen.h))
+        })
+        .collect()
+}
+
+/// A screen macOS believes is plugged in, sized for the client's monitor.
+fn virtual_display(screen: ScreenMode, hidpi: bool, queue: &DispatchQueue) -> Result<(Retained<AnyObject>, u32)> {
+    let offered = modes(screen, hidpi);
+    let (max_w, max_h) = offered[0];
     unsafe {
         let descriptor: Retained<AnyObject> = msg_send![class(c"CGVirtualDisplayDescriptor")?, new];
         let _: () = msg_send![&descriptor, setDispatchQueue: queue];
         let _: () = msg_send![&descriptor, setName: &*NSString::from_str("Glide")];
-        let _: () = msg_send![&descriptor, setMaxPixelsWide: screen.w];
-        let _: () = msg_send![&descriptor, setMaxPixelsHigh: screen.h];
+        let _: () = msg_send![&descriptor, setMaxPixelsWide: max_w];
+        let _: () = msg_send![&descriptor, setMaxPixelsHigh: max_h];
         let size = CGSize::new(screen.w as f64 * MM_PER_PIXEL, screen.h as f64 * MM_PER_PIXEL);
         let _: () = msg_send![&descriptor, setSizeInMillimeters: size];
         // Stable IDs, so macOS remembers where this screen was arranged.
@@ -229,16 +256,17 @@ fn virtual_display(screen: ScreenMode, queue: &DispatchQueue) -> Result<(Retaine
         let display: Option<Retained<AnyObject>> = msg_send![allocated, initWithDescriptor: &*descriptor];
         let display = display.context("macOS refused to create a virtual display")?;
 
-        let allocated: Allocated<AnyObject> = msg_send![class(c"CGVirtualDisplayMode")?, alloc];
-        let mode: Retained<AnyObject> = msg_send![
-            allocated,
-            initWithWidth: screen.w,
-            height: screen.h,
-            refreshRate: screen.hz as f64
-        ];
+        let mode_class = class(c"CGVirtualDisplayMode")?;
+        let mut all = Vec::with_capacity(offered.len());
+        for (w, h) in offered {
+            let allocated: Allocated<AnyObject> = msg_send![mode_class, alloc];
+            let mode: Retained<AnyObject> =
+                msg_send![allocated, initWithWidth: w, height: h, refreshRate: screen.hz as f64];
+            all.push(mode);
+        }
         let settings: Retained<AnyObject> = msg_send![class(c"CGVirtualDisplaySettings")?, new];
-        let _: () = msg_send![&settings, setHiDPI: 0_u32];
-        let modes = NSArray::from_retained_slice(&[mode]);
+        let _: () = msg_send![&settings, setHiDPI: hidpi as u32];
+        let modes = NSArray::from_retained_slice(&all);
         let _: () = msg_send![&settings, setModes: &*modes];
         let applied: bool = msg_send![&display, applySettings: &*settings];
         if !applied {
@@ -293,6 +321,63 @@ fn beside(target: &Screen, w: i32, h: i32, side: Side) -> (i32, i32) {
         Side::Left => (target.x - w, target.y + (th - h) / 2),
         Side::Right => (target.x + tw, target.y + (th - h) / 2),
     }
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGDisplayCopyAllDisplayModes(display: u32, options: *const c_void) -> *const c_void;
+    fn CGDisplayModeGetWidth(mode: *const c_void) -> usize;
+    fn CGDisplayModeGetHeight(mode: *const c_void) -> usize;
+    fn CGDisplayModeGetPixelWidth(mode: *const c_void) -> usize;
+    fn CGConfigureDisplayWithDisplayMode(config: *mut c_void, display: u32, mode: *const c_void, options: *const c_void) -> i32;
+}
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFArrayGetCount(array: *const c_void) -> isize;
+    fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
+    fn CFRelease(cf: *mut c_void);
+}
+
+/// Switch to the HiDPI mode that looks like the client's monitor: drawn at
+/// twice its pixels, shown at its size. macOS starts a new virtual display at
+/// 1x, and may take a moment to list the rest.
+///
+/// ponytail: sets this default every time Extend starts, so a scaled mode
+/// picked in RDM or System Settings lasts until the display is next rebuilt.
+unsafe fn use_hidpi(id: u32, screen: ScreenMode) -> Result<()> {
+    // The value of kCGDisplayShowDuplicateLowResolutionModes, which is not
+    // its own name. Without it the HiDPI modes are left out of the list.
+    let key = NSString::from_str("kCGDisplayResolution");
+    let options = NSDictionary::from_slices(&[&*key], &[&*NSNumber::numberWithBool(true)]);
+    let (w, h) = (screen.w as usize, screen.h as usize);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while std::time::Instant::now() < deadline {
+        let list = unsafe { CGDisplayCopyAllDisplayModes(id, Retained::as_ptr(&options).cast()) };
+        if !list.is_null() {
+            let found = (0..unsafe { CFArrayGetCount(list) })
+                .map(|i| unsafe { CFArrayGetValueAtIndex(list, i) })
+                .find(|&m| unsafe {
+                    CGDisplayModeGetWidth(m) == w && CGDisplayModeGetHeight(m) == h && CGDisplayModeGetPixelWidth(m) == 2 * w
+                });
+            let applied = found.map(|mode| unsafe {
+                let mut config = null_mut();
+                CGBeginDisplayConfiguration(&mut config);
+                CGConfigureDisplayWithDisplayMode(config, id, mode, std::ptr::null());
+                CGCompleteDisplayConfiguration(config, FOR_SESSION)
+            });
+            unsafe { CFRelease(list as *mut c_void) };
+            match applied {
+                Some(0) => {
+                    tracing::info!(w, h, "virtual display in HiDPI");
+                    return Ok(());
+                }
+                Some(status) => bail!("macOS refused the mode (status {status})"),
+                None => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    bail!("macOS never offered a {w}×{h} HiDPI mode")
 }
 
 /// `SCDisplay` is only handed out through a completion block.
@@ -600,6 +685,15 @@ mod tests {
     }
 
     #[test]
+    fn hidpi_offers_retina_steps_with_the_monitor_size_first() {
+        let fhd = ScreenMode { w: 1920, h: 1080, hz: 60 };
+        assert_eq!(modes(fhd, true), [(3840, 2160), (3200, 1800), (2560, 1440), (1920, 1080)]);
+        assert_eq!(modes(fhd, false), [(1920, 1080)]);
+        let odd = ScreenMode { w: 1366, h: 768, hz: 60 };
+        assert!(modes(odd, true).iter().all(|(w, h)| w % 2 == 0 && h % 2 == 0), "{:?}", modes(odd, true));
+    }
+
+    #[test]
     fn short_length_prefixes_work_too() {
         assert_eq!(to_annex_b(&[0, 1, 7], 2, &[]).unwrap(), [0, 0, 0, 1, 7]);
     }
@@ -611,17 +705,40 @@ mod tests {
     #[test]
     #[ignore]
     fn a_virtual_display_comes_and_goes() {
-        let before = crate::screens::local().len();
+        #[link(name = "CoreGraphics", kind = "framework")]
+        unsafe extern "C" {
+            fn CGDisplayIsActive(display: u32) -> bool;
+            fn CGDisplayBounds(display: u32) -> objc2_core_foundation::CGRect;
+        }
+        let before = crate::screens::local();
         let queue = DispatchQueue::new("dev.glide.test", DispatchQueueAttr::SERIAL);
-        let (display, id) = virtual_display(ScreenMode { w: 1920, h: 1080, hz: 60 }, &queue).unwrap();
-        assert_ne!(id, 0);
+        let (display, id) = virtual_display(ScreenMode { w: 1920, h: 1080, hz: 60 }, true, &queue).unwrap();
         std::thread::sleep(Duration::from_secs(1));
-        let during = crate::screens::local();
-        assert_eq!(during.len(), before + 1, "{during:?}");
-        assert!(during.iter().any(|s| s.w == 1920 && s.h == 1080), "{during:?}");
+        assert!(unsafe { CGDisplayIsActive(id) }, "the display never came up");
+        let points = unsafe { CGDisplayBounds(id) }.size;
+        assert_eq!((points.width, points.height), (1920.0, 1080.0));
+        unsafe { use_hidpi(id, ScreenMode { w: 1920, h: 1080, hz: 60 }) }.expect("switch to HiDPI");
+        std::thread::sleep(Duration::from_millis(500));
+        let points = unsafe { CGDisplayBounds(id) }.size;
+        assert_eq!((points.width, points.height), (1920.0, 1080.0), "HiDPI still looks like the monitor's size");
+        assert_eq!(crate::screens::local(), before, "glide's own display must not count as a real one");
         drop(display);
-        std::thread::sleep(Duration::from_secs(1));
-        assert_eq!(crate::screens::local().len(), before, "the display must go away when dropped");
+        let dropped = std::time::Instant::now();
+        let listed = || {
+            #[link(name = "CoreGraphics", kind = "framework")]
+            unsafe extern "C" {
+                fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+            }
+            let (mut ids, mut n) = ([0u32; 16], 0u32);
+            unsafe { CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) };
+            ids[..n as usize].contains(&id)
+        };
+        eprintln!("right after drop: active={} listed={}", unsafe { CGDisplayIsActive(id) }, listed());
+        while listed() && dropped.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        eprintln!("gone after {:?}", dropped.elapsed());
+        assert!(!listed(), "the display must go away when dropped");
     }
 
     /// The real thing, end to end on this Mac: a virtual display appears,
@@ -634,7 +751,7 @@ mod tests {
         let slot = Arc::new(Slot::default());
         let screen = ScreenMode { w: 1920, h: 1080, hz: 60 };
         let place = Place { side: Side::Top, display: Some(1) };
-        let capture = Capture::start(screen, place, 20_000_000, slot.clone()).expect("start");
+        let capture = Capture::start(screen, place, true, 20_000_000, slot.clone()).expect("start");
         let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
         let frame = runtime
             .block_on(async { tokio::time::timeout(Duration::from_secs(5), slot.pop()).await })
