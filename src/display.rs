@@ -52,12 +52,10 @@ pub struct Settings {
     pub bitrate_mbps: u32,
     /// Offer Retina modes on the virtual display. The stream stays at the
     /// client's pixels either way; HiDPI only changes what macOS draws.
-    #[serde(default = "default_hidpi")]
+    /// Off by default: on a 1080p client, drawing at 2x and shrinking every
+    /// frame back down leaves text softer than drawing it 1:1.
+    #[serde(default)]
     pub hidpi: bool,
-}
-
-fn default_hidpi() -> bool {
-    true
 }
 
 fn default_workspace() -> u8 {
@@ -74,7 +72,7 @@ impl Default for Settings {
             mode: Mode::Control,
             workspace: default_workspace(),
             bitrate_mbps: default_bitrate(),
-            hidpi: default_hidpi(),
+            hidpi: false,
         }
     }
 }
