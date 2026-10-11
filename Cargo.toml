@@ -25,7 +25,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "net", "io-util"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -34,6 +34,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Reads and writes the clipboard by MIME type, so an image crosses as the bytes
 # it already is instead of a decoded bitmap.
 wl-clipboard-rs = "0.9"
+# CLOCK_MONOTONIC, to stamp typed events the way the compositor expects.
+libc = "0.2"
 # The receiving end of an extended display: hardware decode straight to a
 # Wayland surface, no copies through this process.
 gstreamer = "0.25"

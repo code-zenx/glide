@@ -117,9 +117,25 @@ impl Handover {
         }
     }
 
+    /// The peer input is flowing to or from, if any.
+    fn peer(&self) -> Option<CaptureHandle> {
+        match self.mode {
+            Mode::Local => None,
+            Mode::Sending(handle) | Mode::Receiving(handle) => Some(handle),
+        }
+    }
+
     /// Our own capture grabbed the cursor at this edge.
     fn began(&mut self, handle: CaptureHandle) {
         self.mode = Mode::Sending(handle);
+    }
+
+    /// The peer driving this machine, if any.
+    fn receiving(&self) -> Option<CaptureHandle> {
+        match self.mode {
+            Mode::Receiving(handle) => Some(handle),
+            _ => None,
+        }
     }
 
     /// The peer this machine is driving, if any.
@@ -188,7 +204,7 @@ impl Handover {
 
 /// Asked for from outside the daemon — today, from the macOS menu bar, which
 /// is the only thing that builds one.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[derive(Debug)]
 pub enum Control {
     /// Move a peer's screen to another edge, optionally of one display only.
     SetPosition(CaptureHandle, Side, Option<usize>),
@@ -196,13 +212,40 @@ pub enum Control {
     RetryBackends,
     /// Switch between driving the peer and extending this screen onto it.
     SetMode(DisplayMode),
+    /// Switch one peer off (or back on). Paused: its edge is disarmed, no
+    /// clipboard crosses, and it is told so; the link itself stays up.
+    SetEnabled(CaptureHandle, bool),
+    /// From this machine's own bar: a client stops being driven (and tells the
+    /// server); undone with `false`.
+    Pause(bool),
+    /// Bring input back to this machine now, wherever the cursor is.
+    Release,
 }
 
 /// Whether a peer's screen edge should be armed: only with a live link behind
-/// it, and never while the peer is showing our extended display — the cursor
-/// then belongs on the virtual screen, not in the peer.
-fn edge_wanted(linked: bool, extending: bool) -> bool {
-    linked && !extending
+/// it, never while the peer is showing our extended display — the cursor
+/// then belongs on the virtual screen, not in the peer — and never while the
+/// peer is switched off.
+fn edge_wanted(linked: bool, extending: bool, enabled: bool) -> bool {
+    linked && !extending && enabled
+}
+
+/// Switching a peer off while it holds the cursor must bring the cursor home
+/// first: its edge is about to go, and nothing else would return it.
+fn pause_takes_back(sending: Option<CaptureHandle>, handle: CaptureHandle, on: bool) -> bool {
+    !on && sending == Some(handle)
+}
+
+/// Bring input home from `peer`: the peer saw these keys go down but will
+/// never see them come up, so say so before saying goodbye.
+async fn hand_back(capture: &mut Option<InputCapture>, links: &Links, peer: &str, handover: &mut Handover) -> Result<()> {
+    let held = capture.as_mut().map(|c| c.take_pressed_keys()).unwrap_or_default();
+    for key in held {
+        links.send(peer, Msg::Input(Event::Keyboard(KeyboardEvent::Key { time: 0, key: key as u32, state: 0 })));
+    }
+    links.send(peer, Msg::Leave);
+    handover.take_back();
+    release(capture.as_mut()).await
 }
 
 async fn set_edge(capture: &mut InputCapture, handle: usize, peer: &Peer, on: bool) -> Result<()> {
@@ -242,6 +285,13 @@ pub async fn session(
     // above this screen that is every trip to the menu bar.
     let mut armed = vec![false; config.peers.len()];
     let mut linked = vec![false; config.peers.len()];
+    let mut enabled: Vec<bool> = config.peers.iter().map(|p| !server || p.enabled).collect();
+    // A client that paused itself: like switched off, but its choice, not saved here.
+    let mut held_off = vec![false; config.peers.len()];
+    for (i, on) in enabled.iter().enumerate() {
+        links.set_paused(&names[i], !on);
+        status.set_peer(&names[i], |p| p.paused = !on);
+    }
     // Only a server has a display to extend.
     let mut extending = server && config.display.mode == DisplayMode::Extend;
     for i in 0..config.peers.len() {
@@ -255,19 +305,21 @@ pub async fn session(
     // allocates unless something actually changed: `Status::set` clones the
     // whole state to compare it, and at a thousand events a second that is all
     // wasted work on the path that has to stay quick.
-    let mut shown = ("", !degraded);
-    let publish = |handover: &Handover, degraded: bool, shown: &mut (&'static str, bool)| {
-        let now = (handover.name(), !degraded);
+    let mut shown = ("", None, !degraded);
+    let publish = |handover: &Handover, degraded: bool, shown: &mut (&'static str, Option<CaptureHandle>, bool)| {
+        let now = (handover.name(), handover.peer(), !degraded);
         if *shown != now {
             *shown = now;
             status.set(|s| {
-                s.mode = now.0.into();
+                s.flow = now.0.into();
+                s.active = now.1.and_then(|h| names.get(h as usize)).cloned().unwrap_or_default();
                 s.denied = degraded;
             });
         }
     };
     status.set(|s| {
-        s.mode = handover.name().into();
+        s.flow = handover.name().into();
+        s.active.clear();
         s.denied = degraded;
     });
     loop {
@@ -305,19 +357,7 @@ pub async fn session(
                         server && capture.as_ref().is_some_and(|c| c.keys_pressed(&RELEASE_CHORD));
                     if chord {
                         info!("release chord pressed, taking input back");
-                        // The peer saw these keys go down but will never see
-                        // them come up, so say so before we stop sending.
-                        let held = capture.as_mut().map(|c| c.take_pressed_keys()).unwrap_or_default();
-                        for key in held {
-                            links.send(peer, Msg::Input(Event::Keyboard(KeyboardEvent::Key {
-                                time: 0,
-                                key: key as u32,
-                                state: 0,
-                            })));
-                        }
-                        links.send(peer, Msg::Leave);
-                        handover.take_back();
-                        release(capture.as_mut()).await?;
+                        hand_back(&mut capture, &links, peer, &mut handover).await?;
                     }
                     publish(&handover, degraded, &mut shown);
                 }
@@ -340,8 +380,14 @@ pub async fn session(
                 let _ = display.send(display::Event::Link(peer.clone(), up));
                 let Some(handle) = names.iter().position(|n| *n == peer) else { continue };
                 linked[handle] = up;
+                if up && !enabled[handle] {
+                    links.send(&peer, Msg::Paused(true));
+                }
                 let Some(capture) = capture.as_mut() else { continue };
-                let want = edge_wanted(up, extending);
+                if !up {
+                    held_off[handle] = false;
+                }
+                let want = edge_wanted(up, extending, enabled[handle] && !held_off[handle]);
                 if want == armed[handle] {
                     continue;
                 }
@@ -373,13 +419,72 @@ pub async fn session(
                     }
                     if let Some(capture) = capture.as_mut() {
                         for (i, peer) in config.peers.iter().enumerate() {
-                            let want = edge_wanted(linked[i], extending);
+                            let want = edge_wanted(linked[i], extending, enabled[i] && !held_off[i]);
                             if want != armed[i] {
                                 armed[i] = want;
                                 set_edge(capture, i, peer, want).await?;
                             }
                         }
                     }
+                    publish(&handover, degraded, &mut shown);
+                    continue;
+                }
+                if let Control::Release = asked {
+                    if let Some(handle) = handover.sending() {
+                        info!(peer = %names[handle as usize], "release asked for, taking input back");
+                        hand_back(&mut capture, &links, &names[handle as usize].clone(), &mut handover).await?;
+                    } else if let Some(handle) = handover.receiving() {
+                        // A client gives the cursor back the way its edge would.
+                        links.send(&names[handle as usize], Msg::Leave);
+                        if let Some(emulation) = emulation.as_mut() {
+                            let _ = emulation.release_keys(handle).await;
+                        }
+                        handover.take_back();
+                    }
+                    publish(&handover, degraded, &mut shown);
+                    continue;
+                }
+                if let Control::Pause(paused) = asked {
+                    // Only a client has anything to refuse; the server's own
+                    // switch is per client (SetEnabled).
+                    if !server {
+                        handover.driven = !paused;
+                        for (i, name) in names.iter().enumerate() {
+                            links.send(name, Msg::Paused(paused));
+                            status.set_peer(name, |p| p.paused = paused);
+                            if paused && handover.receiving() == Some(i as CaptureHandle) {
+                                if let Some(emulation) = emulation.as_mut() {
+                                    let _ = emulation.release_keys(i as CaptureHandle).await;
+                                }
+                                handover.take_back();
+                            }
+                        }
+                        info!(paused, "this machine paused itself");
+                        publish(&handover, degraded, &mut shown);
+                    }
+                    continue;
+                }
+                if let Control::SetEnabled(handle, on) = asked {
+                    let i = handle as usize;
+                    let Some(peer) = names.get(i).cloned() else { continue };
+                    if pause_takes_back(handover.sending(), handle, on) {
+                        info!(%peer, "switched off while it had the cursor, taking input back");
+                        hand_back(&mut capture, &links, &peer, &mut handover).await?;
+                    }
+                    enabled[i] = on;
+                    config.peers[i].enabled = on;
+                    links.set_paused(&peer, !on);
+                    status.set_peer(&peer, |p| p.paused = !on);
+                    links.send(&peer, Msg::Paused(!on));
+                    if let Err(e) = crate::set_enabled(&config_path, &peer, on) {
+                        warn!(%peer, "cannot save the switch: {e}");
+                    }
+                    let want = edge_wanted(linked[i], extending, on && !held_off[i]);
+                    if let Some(capture) = capture.as_mut().filter(|_| want != armed[i]) {
+                        armed[i] = want;
+                        set_edge(capture, i, &config.peers[i], want).await?;
+                    }
+                    info!(%peer, on, "peer switched");
                     publish(&handover, degraded, &mut shown);
                     continue;
                 }
@@ -459,6 +564,8 @@ pub async fn session(
                         if handover.peer_input(handle) {
                             match emulation.as_mut() {
                                 Some(emulation) => {
+                                    #[cfg(not(target_os = "macos"))]
+                                    let event = stamp_now(event);
                                     if let Err(e) = emulation.consume(event, handle).await {
                                         warn!(%peer, "cannot emulate: {e}");
                                     }
@@ -487,6 +594,31 @@ pub async fn session(
                     Msg::Screens(screens) => {
                         info!(%peer, count = screens.len(), "peer described its screens");
                         status.set_screens(&peer, screens);
+                    }
+                    // The server switched this machine off or on. Only shown:
+                    // the server already stopped sending.
+                    // From the server: it switched this machine off or on; only
+                    // shown, the server already stopped sending. From a client:
+                    // it paused itself, so its edge goes and the cursor comes home.
+                    Msg::Paused(paused) => {
+                        let i = handle as usize;
+                        if server {
+                            if paused && handover.sending() == Some(handle) {
+                                hand_back(&mut capture, &links, &peer, &mut handover).await?;
+                            }
+                            held_off[i] = paused;
+                            status.set_peer(&peer, |p| p.paused = paused || !enabled[i]);
+                            let want = edge_wanted(linked[i], extending, enabled[i] && !paused);
+                            if let Some(capture) = capture.as_mut().filter(|_| want != armed[i]) {
+                                armed[i] = want;
+                                set_edge(capture, i, &config.peers[i], want).await?;
+                            }
+                            info!(%peer, paused, "client paused itself");
+                        } else {
+                            status.set_peer(&peer, |p| p.paused = paused);
+                            info!(%peer, paused, "server switched this machine");
+                        }
+                        publish(&handover, degraded, &mut shown);
                     }
                     Msg::Display(_) | Msg::DisplayReady(_) => {
                         let _ = display.send(display::Event::Msg(peer, msg));
@@ -558,6 +690,32 @@ fn push_clipboard(links: &Arc<Links>, peer: &str) {
     });
 }
 
+/// Stamp an arriving event with this machine's clock before it is typed.
+///
+/// The Mac capture sends every event with `time: 0`, and the wlroots backend
+/// hands that straight to the compositor. Chromium ignores a dialog click that
+/// looks older than the dialog (its guard against accidental clicks), so Edge's
+/// "Add extension" button never worked through glide. Wayland times are
+/// `CLOCK_MONOTONIC` in milliseconds, wrapping at `u32`.
+#[cfg(not(target_os = "macos"))]
+fn stamp_now(mut event: Event) -> Event {
+    use input_event::PointerEvent;
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: `ts` is a valid, writable timespec.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    let now = (ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000) as u32;
+    match &mut event {
+        Event::Pointer(
+            PointerEvent::Motion { time, .. }
+            | PointerEvent::Button { time, .. }
+            | PointerEvent::Axis { time, .. },
+        )
+        | Event::Keyboard(KeyboardEvent::Key { time, .. }) => *time = now,
+        _ => {}
+    }
+    event
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +723,15 @@ mod tests {
     /// A client: driven by the server, shares nothing of its own.
     fn client() -> Handover {
         Handover::new(true)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn arriving_events_get_a_real_time() {
+        use input_event::PointerEvent;
+        let click = Event::Pointer(PointerEvent::Button { time: 0, button: 0x110, state: 1 });
+        let Event::Pointer(PointerEvent::Button { time, .. }) = stamp_now(click) else { unreachable!() };
+        assert_ne!(time, 0);
     }
 
     #[test]
@@ -640,10 +807,11 @@ mod tests {
     /// instead of walking onto the virtual display beside it.
     #[test]
     fn extending_disarms_the_edge() {
-        assert!(edge_wanted(true, false));
-        assert!(!edge_wanted(true, true), "extended: the edge must be gone");
-        assert!(!edge_wanted(false, false), "no link: no edge");
-        assert!(!edge_wanted(false, true));
+        assert!(edge_wanted(true, false, true));
+        assert!(!edge_wanted(true, true, true), "extended: the edge must be gone");
+        assert!(!edge_wanted(false, false, true), "no link: no edge");
+        assert!(!edge_wanted(false, true, true));
+        assert!(!edge_wanted(true, false, false), "switched off: no edge");
     }
 
     #[test]
@@ -672,5 +840,13 @@ mod tests {
         assert!(!h.peer_input(0));
         assert_eq!(h.peer_left(0), Cleanup::ReleaseCapture);
         assert_eq!(h.name(), "local");
+    }
+
+    #[test]
+    fn pausing_the_peer_with_the_cursor_takes_it_back() {
+        assert!(pause_takes_back(Some(1), 1, false), "off while it has the cursor: bring it home");
+        assert!(!pause_takes_back(Some(0), 1, false), "another peer has it: leave it");
+        assert!(!pause_takes_back(None, 1, false), "nobody has it: nothing to take");
+        assert!(!pause_takes_back(Some(1), 1, true), "switching on never takes anything");
     }
 }

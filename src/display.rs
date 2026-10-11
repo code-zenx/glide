@@ -498,7 +498,7 @@ mod tests {
             role: Role::Server,
             listen: "127.0.0.1:0".parse().unwrap(),
             display: Settings::default(),
-            peers: vec![Peer { name: "peer".into(), addrs, fingerprint: peer.fingerprint(), position: Side::Right, display: None }],
+            peers: vec![Peer { name: "peer".into(), addrs, fingerprint: peer.fingerprint(), position: Side::Right, display: None, enabled: true }],
         };
         let receiver = endpoint(&config(&id_mac, vec![]), &id_linux)?;
         let addr = receiver.endpoint.local_addr()?;

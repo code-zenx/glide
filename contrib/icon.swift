@@ -29,7 +29,10 @@ let outPath = args[1]
 let size: Double = args.count >= 3 ? (Double(args[2]) ?? 0) : 1024
 // A menu bar image is a template: macOS keeps only its alpha and tints it to
 // match the bar, so it is the bare letter with no plate and no colour.
-let template = args.count >= 4 && args[3] == "template"
+let svg = args.count >= 4 && args[3] == "svg"
+// An SVG badge for a Linux status bar is the same silhouette as the menu bar
+// template, filled with a state colour instead of left for macOS to tint.
+let template = args.count >= 4 && (args[3] == "template" || svg)
 guard size >= 16 else {
     FileHandle.standardError.write(Data("icon.swift: size must be >= 16\n".utf8))
     exit(2)
@@ -182,6 +185,45 @@ if template {
         end: CGPoint(x: 0, y: u(badgeInset)),
         options: [])
     ctx.restoreGState()
+}
+
+// ---------------------------------------------------------------- svg
+
+// `swift icon.swift out.svg 1024 svg <top hex> <bottom hex>`: the template
+// silhouette as path data, so a bar can draw it at any size and colour.
+if svg {
+    let top = args.count >= 5 ? args[4] : "#9B86FF"
+    let bottom = args.count >= 6 ? args[5] : top
+    var d = ""
+    // Core Graphics counts y up from the bottom; SVG counts down from the top.
+    func p(_ pt: CGPoint) -> String { String(format: "%.1f %.1f", pt.x, u(1024) - pt.y) }
+    mark.applyWithBlock { element in
+        let e = element.pointee
+        switch e.type {
+        case .moveToPoint: d += "M\(p(e.points[0]))"
+        case .addLineToPoint: d += "L\(p(e.points[0]))"
+        case .addQuadCurveToPoint: d += "Q\(p(e.points[0])) \(p(e.points[1]))"
+        case .addCurveToPoint: d += "C\(p(e.points[0])) \(p(e.points[1])) \(p(e.points[2]))"
+        case .closeSubpath: d += "Z"
+        @unknown default: break
+        }
+    }
+    let side = Int(size)
+    let doc = """
+    <svg xmlns="http://www.w3.org/2000/svg" width="\(side)" height="\(side)" viewBox="0 0 \(side) \(side)">
+    <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="\(top)"/><stop offset="1" stop-color="\(bottom)"/></linearGradient></defs>
+    <path fill="url(#g)" fill-rule="evenodd" d="\(d)"/>
+    </svg>
+
+    """
+    do {
+        try doc.write(toFile: outPath, atomically: true, encoding: .utf8)
+    } catch {
+        FileHandle.standardError.write(Data("icon.swift: could not write \(outPath)\n".utf8))
+        exit(1)
+    }
+    print("wrote \(outPath)")
+    exit(0)
 }
 
 // ---------------------------------------------------------------- write

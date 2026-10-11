@@ -40,6 +40,9 @@ pub enum Msg {
     /// The client's answer to `Display(Show::On)`: the mode of the screen it
     /// will show the display on, or why it cannot.
     DisplayReady(Result<ScreenMode, String>),
+    /// "I have switched you off" (or back on). The server sends it when its
+    /// owner pauses a client; the link stays up so both ends can show it.
+    Paused(bool),
 }
 
 /// What the server asks a client's screen to do with its extended display.
@@ -131,6 +134,10 @@ impl Msg {
                 out.push(12);
                 out.extend_from_slice(why.as_bytes());
             }
+            Msg::Paused(on) => {
+                out.push(13);
+                out.push(*on as u8);
+            }
             Msg::Screens(screens) => {
                 out.push(6);
                 out.push(screens.len().min(u8::MAX as usize) as u8);
@@ -184,6 +191,7 @@ impl Msg {
                 hz: u32_at(rest, 8)?,
             })),
             12 => Msg::DisplayReady(Err(String::from_utf8_lossy(rest).into_owned())),
+            13 => Msg::Paused(*rest.first().context("no paused flag")? != 0),
             _ => bail!("unknown message tag {tag}"),
         })
     }
@@ -349,5 +357,15 @@ mod tests {
             assert!(Msg::decode(&full[..len]).is_err(), "accepted {len} bytes");
         }
         assert!(Msg::decode(&[99, 9, 9]).is_err(), "an unknown tag");
+    }
+
+    #[test]
+    fn a_pause_crosses_intact() {
+        for on in [true, false] {
+            let msg = Msg::Paused(on);
+            assert_eq!(Msg::decode(&msg.encode()).unwrap(), msg);
+            assert_eq!(msg.route(), Route::Stream, "a pause must arrive");
+        }
+        assert!(Msg::decode(&[13]).is_err(), "no flag is refused, not guessed");
     }
 }

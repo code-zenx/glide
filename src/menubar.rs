@@ -26,7 +26,6 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::display::Mode;
 use crate::input::Control;
 use crate::status::Status;
-use crate::Side;
 
 /// How often the bar re-reads the daemon's state.
 const REFRESH_SECONDS: f64 = 1.0;
@@ -37,11 +36,11 @@ pub struct Ivars {
     status: Arc<Status>,
     control: UnboundedSender<Control>,
     config_path: PathBuf,
-    peer_name: String,
-    side: std::cell::Cell<Side>,
-    display: std::cell::Cell<Option<usize>>,
     /// The Control / Extend pair, ticked to match the current mode.
     modes: RefCell<Vec<(Mode, Retained<NSMenuItem>)>>,
+    /// One row per client, ticked while it is switched on; the row's tag is
+    /// the peer's index in the config.
+    clients: RefCell<Vec<(String, bool, Retained<NSMenuItem>)>>,
     /// Kept alive so the window survives being closed and reopened.
     window: RefCell<Option<Retained<NSWindow>>>,
 }
@@ -58,13 +57,23 @@ define_class!(
         fn arrange_window(&self, _sender: &NSMenuItem) {
             let Some(mtm) = MainThreadMarker::new() else { return };
             let ivars = self.ivars();
+            // Read fresh, so a client added to the config shows up without a restart.
+            let peers = match crate::arrange_peers(&ivars.config_path) {
+                Ok(peers) => peers,
+                Err(e) => return tracing::warn!("cannot read the config to arrange: {e}"),
+            };
+            let peers = peers
+                .into_iter()
+                .enumerate()
+                .map(|(i, (name, side, display))| {
+                    let screens = ivars.status.screens_of(&name);
+                    crate::arrange::PeerView::new(name, screens, side, display, i)
+                })
+                .collect();
             let window = crate::arrange::window(
                 mtm,
                 crate::screens::local(),
-                ivars.status.screens_of(&ivars.peer_name),
-                ivars.peer_name.clone(),
-                ivars.side.get(),
-                ivars.display.get(),
+                peers,
                 ivars.control.clone(),
                 ivars.config_path.clone(),
             );
@@ -89,6 +98,17 @@ define_class!(
         #[unsafe(method(extendMode:))]
         fn extend_mode(&self, _sender: &NSMenuItem) {
             self.set_mode(Mode::Extend);
+        }
+
+        /// Switch the clicked client off, or back on.
+        #[unsafe(method(toggleClient:))]
+        fn toggle_client(&self, sender: &NSMenuItem) {
+            let index = sender.tag() as usize;
+            let mut clients = self.ivars().clients.borrow_mut();
+            let Some((_, on, item)) = clients.get_mut(index) else { return };
+            *on = !*on;
+            item.setState(if *on { NSControlStateValueOn } else { NSControlStateValueOff });
+            let _ = self.ivars().control.send(Control::SetEnabled(index as _, *on));
         }
 
         #[unsafe(method(quit:))]
@@ -205,6 +225,18 @@ fn menu_bar_icon(mtm: MainThreadMarker) -> Option<Retained<NSImage>> {
     Some(image)
 }
 
+/// One client's row: name, then what it is doing.
+fn client_row(state: &crate::status::State, peer: &crate::status::PeerState) -> String {
+    let what = match state.mode_of(peer).as_str() {
+        _ if peer.paused => "paused".to_string(),
+        "sending" => "controlling".to_string(),
+        "receiving" => "controlling this Mac".to_string(),
+        "local" => peer.rtt_ms.map_or("linked".to_string(), |r| format!("linked · {r:.1} ms")),
+        _ => "offline".to_string(),
+    };
+    format!("{}   {what}", peer.name)
+}
+
 /// A line of text that is information, not a command.
 fn note(mtm: MainThreadMarker, text: &str) -> Retained<NSMenuItem> {
     let item = NSMenuItem::new(mtm);
@@ -236,10 +268,9 @@ pub fn run(
     status: Arc<Status>,
     control: UnboundedSender<Control>,
     config_path: PathBuf,
-    current: Side,
-    display: Option<usize>,
     peer_name: String,
     mode: Mode,
+    clients: Vec<(String, bool)>,
 ) -> Result<()> {
     let mtm = MainThreadMarker::new().context("the menu bar must run on the main thread")?;
     let app = NSApplication::sharedApplication(mtm);
@@ -250,10 +281,8 @@ pub fn run(
         status: status.clone(),
         control,
         config_path,
-        peer_name: peer_name.clone(),
-        side: std::cell::Cell::new(current),
-        display: std::cell::Cell::new(display),
         modes: RefCell::new(Vec::new()),
+        clients: RefCell::new(Vec::new()),
         window: RefCell::new(None),
     });
 
@@ -267,6 +296,23 @@ pub fn run(
     for line in [&who, &flow, &speed] {
         menu.addItem(line);
     }
+
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    // Each client, ticked while it is on. Clicking one pauses it: its edge
+    // goes, nothing crosses, and it says so in its own bar.
+    menu.addItem(&note(mtm, "Clients"));
+    let rows: Vec<(String, bool, Retained<NSMenuItem>)> = clients
+        .into_iter()
+        .enumerate()
+        .map(|(i, (name, on))| {
+            let row = command(mtm, &name, sel!(toggleClient:), "", &target);
+            row.setTag(i as isize);
+            row.setState(if on { NSControlStateValueOn } else { NSControlStateValueOff });
+            menu.addItem(&row);
+            (name, on, row)
+        })
+        .collect();
+    *target.ivars().clients.borrow_mut() = rows;
 
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     // Drive the peer, or use its monitor as another screen for this Mac.
@@ -300,8 +346,14 @@ pub fn run(
     }
 
     let reader = status.clone();
+    let rows = target.clone();
     let redraw = move || {
         let state = reader.snapshot();
+        for (name, _, row) in rows.ivars().clients.borrow().iter() {
+            if let Some(peer) = state.peers.iter().find(|p| &p.name == name) {
+                row.setTitle(&NSString::from_str(&client_row(&state, peer)));
+            }
+        }
         who.setTitle(&NSString::from_str(&state.headline()));
         flow.setTitle(&NSString::from_str(&state.flow()));
         speed.setTitle(&NSString::from_str(&state.speed()));

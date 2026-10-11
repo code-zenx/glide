@@ -1,4 +1,5 @@
 mod clipboard;
+mod ctl;
 mod display;
 #[cfg(not(target_os = "macos"))]
 mod display_linux;
@@ -73,6 +74,11 @@ enum Cmd {
         #[arg(long)]
         icon: bool,
     },
+    /// Steer the running daemon: pause, resume, release, peer on|off <name>
+    Ctl {
+        #[arg(required = true, trailing_var_arg = true)]
+        words: Vec<String>,
+    },
     /// Run the daemon with a menu bar item: what the app bundle launches
     #[cfg(target_os = "macos")]
     App,
@@ -129,6 +135,18 @@ pub struct Peer {
     /// whole desktop, which is upstream lan-mouse's behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<usize>,
+    /// Switched off from the server's menu: the link stays up so both ends can
+    /// say so, but the edge is disarmed and no clipboard crosses.
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub enabled: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_yes(on: &bool) -> bool {
+    *on
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
@@ -168,11 +186,40 @@ fn config_dir() -> PathBuf {
 
 /// Move a peer's screen to another edge and remember it. The menu bar calls
 /// this, so the arrangement survives a restart.
-pub fn set_position(path: &Path, side: Side, display: Option<usize>) -> Result<()> {
+pub fn set_position(path: &Path, peer_name: &str, side: Side, display: Option<usize>) -> Result<()> {
     let mut config = load(path)?;
-    let peer = config.peers.first_mut().context("no peers to arrange")?;
+    let peer = config
+        .peers
+        .iter_mut()
+        .find(|p| p.name == peer_name)
+        .with_context(|| format!("no peer named {peer_name}"))?;
     peer.position = side;
     peer.display = display;
+    std::fs::write(path, toml::to_string_pretty(&config)?)?;
+    Ok(())
+}
+
+/// Every peer's name and place, for the arrange window.
+#[cfg(target_os = "macos")]
+pub fn arrange_peers(path: &Path) -> Result<Vec<(String, Side, Option<usize>)>> {
+    Ok(load(path)?.peers.into_iter().map(|p| (p.name, p.position, p.display)).collect())
+}
+
+/// Every peer with its switch, for the menu bar's Clients section.
+#[cfg(target_os = "macos")]
+fn config_clients(path: &Path) -> Result<Vec<(String, bool)>> {
+    Ok(load(path)?.peers.into_iter().map(|p| (p.name, p.enabled)).collect())
+}
+
+/// Remember whether a peer is switched on, so a pause survives a restart.
+pub fn set_enabled(path: &Path, peer_name: &str, on: bool) -> Result<()> {
+    let mut config = load(path)?;
+    let peer = config
+        .peers
+        .iter_mut()
+        .find(|p| p.name == peer_name)
+        .with_context(|| format!("no peer named {peer_name}"))?;
+    peer.enabled = on;
     std::fs::write(path, toml::to_string_pretty(&config)?)?;
     Ok(())
 }
@@ -206,6 +253,7 @@ fn daemon(
     identity: link::Identity,
     status: Arc<status::Status>,
     control: tokio::sync::mpsc::UnboundedReceiver<input::Control>,
+    control_tx: tokio::sync::mpsc::UnboundedSender<input::Control>,
 ) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     // The Wayland capture backend spawns non-Send tasks, so the session has to
@@ -216,8 +264,13 @@ fn daemon(
         // Whether each peer is reachable, so the session only arms a screen
         // edge when there is a live link behind it.
         let (link_up, link_state) = tokio::sync::mpsc::unbounded_channel();
-        let peers = config.peers.iter().map(|p| p.name.clone()).collect();
-        tokio::spawn(clipboard::watch(links.clone(), peers));
+        let peers: Vec<String> = config.peers.iter().map(|p| p.name.clone()).collect();
+        tokio::spawn(clipboard::watch(links.clone(), peers.clone()));
+        tokio::spawn(async move {
+            if let Err(e) = ctl::serve(control_tx, peers).await {
+                tracing::warn!("no control socket: {e}");
+            }
+        });
         let net = link::endpoint(&config, &identity)?;
         let (to_display, display_events) = tokio::sync::mpsc::unbounded_channel();
         // Video connections the peer opens to us, handed to the display side.
@@ -342,10 +395,13 @@ fn main() -> Result<()> {
             }
             let identity = link::Identity::load_or_create(&config_dir())?;
             let status = Arc::new(status::Status::default());
-            status.offline(&config.peers[0].name);
-            let (_control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
-            daemon(config, path, identity, status, control_rx)?;
+            for peer in &config.peers {
+                status.offline(&peer.name);
+            }
+            let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
+            daemon(config, path, identity, status, control_rx, control_tx)?;
         }
+        Cmd::Ctl { words } => println!("{}", ctl::send(words)?),
         Cmd::Status { json, watch, icon } => loop {
             let state = status::read();
             println!("{}", if *json { state.json(*icon) } else { state.summary() });
@@ -357,7 +413,7 @@ fn main() -> Result<()> {
         #[cfg(target_os = "macos")]
         Cmd::Snapshot { out, side } => {
             let config = load(&path)?;
-            let peer = config.peers.first().context("no peers in the config")?;
+            anyhow::ensure!(!config.peers.is_empty(), "no peers in the config");
             let side = match side.as_str() {
                 "left" => Side::Left,
                 "top" => Side::Top,
@@ -365,37 +421,83 @@ fn main() -> Result<()> {
                 _ => Side::Right,
             };
             let mtm = objc2_foundation::MainThreadMarker::new().context("not the main thread")?;
-            // A stand-in for the peer's screens when the daemon is not running.
-            let theirs = vec![screens::Screen {
-                name: "HDMI-A-2".into(),
-                x: 0,
-                y: 0,
-                w: 1920,
-                h: 1080,
-            }];
-            arrange::snapshot(mtm, screens::local(), theirs, peer.name.clone(), side, peer.display, out)?;
+            // Stand-ins for the peers' screens when the daemon is not running;
+            // `side` moves the first peer, the rest sit where the config says.
+            let peers = config
+                .peers
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let theirs = vec![screens::Screen { name: "HDMI-A-1".into(), x: 0, y: 0, w: 1920, h: 1080 }];
+                    arrange::PeerView::new(p.name.clone(), theirs, if i == 0 { side } else { p.position }, p.display, i)
+                })
+                .collect();
+            arrange::snapshot(mtm, screens::local(), peers, out)?;
             println!("wrote {}", out.display());
         }
         #[cfg(target_os = "macos")]
         Cmd::App => {
             let config = load(&path)?;
-            let peer = config.peers.first().context("no peers in the config")?;
-            let (position, name, display) = (peer.position, peer.name.clone(), peer.display);
+            let name = config.peers.first().context("no peers in the config")?.name.clone();
             let mode = config.display.mode;
             let identity = link::Identity::load_or_create(&config_dir())?;
             let status = Arc::new(status::Status::default());
-            status.offline(&name);
+            for peer in &config.peers {
+                status.offline(&peer.name);
+            }
             let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
-            let background = (config, path.clone(), identity, status.clone());
+            let background = (config, path.clone(), identity, status.clone(), control_tx.clone());
             std::thread::spawn(move || {
-                let (config, config_path, identity, status) = background;
-                if let Err(e) = daemon(config, config_path, identity, status, control_rx) {
+                let (config, config_path, identity, status, control_tx) = background;
+                if let Err(e) = daemon(config, config_path, identity, status, control_rx, control_tx) {
                     tracing::error!("daemon stopped: {e}");
                 }
             });
             // AppKit owns the main thread from here.
-            menubar::run(status, control_tx, path, position, display, name, mode)?;
+            let clients = config_clients(&path)?;
+            menubar::run(status, control_tx, path, name, mode, clients)?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arranging_one_peer_leaves_the_others_alone() {
+        let path = std::env::temp_dir().join(format!("glide-config-test-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            "name = \"goldengate\"\nrole = \"server\"\n\
+             [[peer]]\nname = \"anorak\"\naddrs = [\"192.168.2.3:4242\"]\nposition = \"top\"\nfingerprint = \"aa\"\n\
+             [[peer]]\nname = \"anton\"\naddrs = [\"192.168.0.5:4242\"]\nposition = \"left\"\nfingerprint = \"bb\"\n",
+        )
+        .unwrap();
+        set_position(&path, "anton", Side::Right, Some(2)).unwrap();
+        let config = load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!((config.peers[0].position, config.peers[0].display), (Side::Top, None));
+        assert_eq!((config.peers[1].position, config.peers[1].display), (Side::Right, Some(2)));
+        assert!(set_position(&path, "nobody", Side::Left, None).is_err());
+    }
+
+    #[test]
+    fn a_pause_is_remembered_and_defaults_to_on() {
+        let path = std::env::temp_dir().join(format!("glide-config-pause-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            "name = \"goldengate\"\nrole = \"server\"\n\
+             [[peer]]\nname = \"anton\"\naddrs = [\"192.168.0.5:4242\"]\nposition = \"left\"\nfingerprint = \"bb\"\n",
+        )
+        .unwrap();
+        assert!(load(&path).unwrap().peers[0].enabled, "a config without the field means on");
+        set_enabled(&path, "anton", false).unwrap();
+        assert!(!load(&path).unwrap().peers[0].enabled);
+        set_enabled(&path, "anton", true).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(!text.contains("enabled"), "on is the default and stays out of the file: {text}");
+    }
 }

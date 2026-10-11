@@ -57,21 +57,38 @@ fn ink(level: f64, alpha: f64) -> Retained<NSColor> {
     NSColor::colorWithSRGBRed_green_blue_alpha(level, level + 0.01, level + 0.04, alpha)
 }
 
+/// One client as the window draws it.
+pub struct PeerView {
+    pub name: String,
+    pub screens: Vec<Screen>,
+    pub side: Cell<Side>,
+    /// Which of this Mac's displays the edge belongs to, counting from 1.
+    pub display: Cell<Option<usize>>,
+    /// The peer's index in the config, which is its handle in the session.
+    pub handle: usize,
+}
+
+impl PeerView {
+    pub fn new(name: String, screens: Vec<Screen>, side: Side, display: Option<usize>, handle: usize) -> Self {
+        Self { name, screens, side: Cell::new(side), display: Cell::new(display), handle }
+    }
+}
+
 struct ViewState {
     local: Vec<Screen>,
-    peer: Vec<Screen>,
-    peer_name: String,
-    side: Cell<Side>,
-    /// Which of this Mac's displays the edge belongs to, counting from 1.
-    display: Cell<Option<usize>>,
+    peers: Vec<PeerView>,
     /// Where each of this Mac's screens was drawn, so a drop can be matched to
     /// the screen it landed against.
     drawn: RefCell<Vec<NSRect>>,
-    /// How far the peer group has been dragged, in view points.
+    /// Where each peer's group was drawn, to find the one a click lands on.
+    groups: RefCell<Vec<NSRect>>,
+    /// How far the grabbed group has been dragged, in view points.
     drag: Cell<NSPoint>,
-    dragging: Cell<bool>,
-    /// Filled in while drawing so the drop can be judged in the same space.
-    centres: Cell<(NSPoint, NSPoint)>,
+    /// Which peer is being dragged, by its place in `peers`.
+    dragging: Cell<Option<usize>>,
+    /// Filled in while drawing so the drop can be judged in the same space:
+    /// this Mac's centre, and each peer group's.
+    centres: RefCell<(NSPoint, Vec<NSPoint>)>,
     control: UnboundedSender<Control>,
     config_path: PathBuf,
 }
@@ -97,13 +114,18 @@ define_class!(
         }
 
         #[unsafe(method(mouseDown:))]
-        fn mouse_down(&self, _event: &NSEvent) {
-            self.ivars().dragging.set(true);
+        fn mouse_down(&self, event: &NSEvent) {
+            // Grab whichever peer group is under the click; empty space grabs nothing.
+            let at = self.convertPoint_fromView(event.locationInWindow(), None);
+            let hit = self.ivars().groups.borrow().iter().position(|g| {
+                at.x >= g.origin.x && at.x <= g.origin.x + g.size.width && at.y >= g.origin.y && at.y <= g.origin.y + g.size.height
+            });
+            self.ivars().dragging.set(hit);
         }
 
         #[unsafe(method(mouseDragged:))]
         fn mouse_dragged(&self, event: &NSEvent) {
-            if !self.ivars().dragging.get() {
+            if self.ivars().dragging.get().is_none() {
                 return;
             }
             // One point of cursor travel is one point of box travel.
@@ -116,8 +138,9 @@ define_class!(
 
         #[unsafe(method(mouseUp:))]
         fn mouse_up(&self, _event: &NSEvent) {
-            self.ivars().dragging.set(false);
-            self.settle();
+            if let Some(i) = self.ivars().dragging.take() {
+                self.settle(i);
+            }
         }
     }
 );
@@ -130,111 +153,44 @@ impl ArrangeView {
         }
     }
 
-    /// Which edge of which display the peer has been dragged to, judged by
+    /// Which edge of which display peer `i` has been dragged to, judged by
     /// where it ended up rather than by how far the hand moved.
-    fn landed_on(&self) -> (Side, Option<usize>) {
+    fn landed_on(&self, i: usize) -> (Side, Option<usize>) {
         let state = self.ivars();
+        let peer = &state.peers[i];
         let moved = state.drag.get();
         if moved.x.abs() < NUDGE && moved.y.abs() < NUDGE {
-            return (state.side.get(), state.display.get());
+            return (peer.side.get(), peer.display.get());
         }
-        let (_, theirs) = state.centres.get();
-        // The screen it was dropped nearest owns the new edge.
-        let drawn = state.drawn.borrow();
-        let nearest = drawn
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| {
-                gap(centre(**a), theirs).total_cmp(&gap(centre(**b), theirs))
-            })
-            .map(|(i, r)| (i + 1, centre(*r)));
-        let (display, mine) = match nearest {
-            Some((index, centre)) => (Some(index), centre),
-            None => (None, state.centres.get().0),
-        };
-        let (dx, dy) = (theirs.x - mine.x, theirs.y - mine.y);
-        let side = if dx.abs() >= dy.abs() {
-            if dx > 0.0 {
-                Side::Right
-            } else {
-                Side::Left
-            }
-        } else if dy > 0.0 {
-            Side::Bottom
-        } else {
-            Side::Top
-        };
-        // One display means the whole desktop is that display; say so plainly.
-        (side, if drawn.len() > 1 { display } else { None })
+        let centres = state.centres.borrow();
+        let theirs = centres.1.get(i).copied().unwrap_or(centres.0);
+        judge(&state.drawn.borrow(), centres.0, theirs)
     }
 
-    fn settle(&self) {
+    fn settle(&self, i: usize) {
         let state = self.ivars();
-        let (side, display) = self.landed_on();
+        let (side, display) = self.landed_on(i);
         state.drag.set(NSPoint::new(0.0, 0.0));
-        if (side, display) != (state.side.get(), state.display.get()) {
-            state.side.set(side);
-            state.display.set(display);
-            if let Err(e) = crate::set_position(&state.config_path, side, display) {
+        let peer = &state.peers[i];
+        if (side, display) != (peer.side.get(), peer.display.get()) {
+            peer.side.set(side);
+            peer.display.set(display);
+            if let Err(e) = crate::set_position(&state.config_path, &peer.name, side, display) {
                 tracing::warn!("cannot save the new arrangement: {e}");
             }
-            let _ = state.control.send(Control::SetPosition(0, side, display));
+            let _ = state.control.send(Control::SetPosition(peer.handle as _, side, display));
         }
         self.setNeedsDisplay(true);
     }
 
-    /// Both machines in one coordinate space: this Mac where the system puts
-    /// it, the peer parked off the chosen edge. No drag applied — dragging
+    /// Every machine in one coordinate space: this Mac where the system puts
+    /// it, each peer parked off its chosen edge. No drag applied — dragging
     /// moves the drawing, not the layout, so the scale never jitters.
-    fn boxes(&self) -> (Vec<(NSRect, String)>, Vec<(NSRect, String)>) {
+    fn boxes(&self) -> (Vec<(NSRect, String)>, Vec<Vec<(NSRect, String)>>) {
         let state = self.ivars();
         let local: Vec<(NSRect, String)> =
             state.local.iter().map(|s| (rect_of(s), describe(s))).collect();
-        // The peer rests against the display it belongs to, so the drawing
-        // matches where the barrier actually is.
-        let bounds = state
-            .display
-            .get()
-            .and_then(|d| local.get(d - 1))
-            .map(|(r, _)| *r)
-            .or_else(|| union(&local))
-            .unwrap_or(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1440.0, 900.0)));
-
-        let peers: Vec<(NSRect, String)> = if state.peer.is_empty() {
-            // The peer has not said what it has; draw one stand-in screen.
-            vec![(
-                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1920.0, 1080.0)),
-                "screen".to_string(),
-            )]
-        } else {
-            state.peer.iter().map(|s| (rect_of(s), describe(s))).collect()
-        };
-        let theirs = union(&peers).unwrap_or(bounds);
-
-        let (dx, dy) = match state.side.get() {
-            Side::Left => (
-                bounds.origin.x - theirs.size.width - MACHINE_GAP - theirs.origin.x,
-                centre_on(bounds.origin.y, bounds.size.height, theirs.origin.y, theirs.size.height),
-            ),
-            Side::Right => (
-                bounds.origin.x + bounds.size.width + MACHINE_GAP - theirs.origin.x,
-                centre_on(bounds.origin.y, bounds.size.height, theirs.origin.y, theirs.size.height),
-            ),
-            Side::Top => (
-                centre_on(bounds.origin.x, bounds.size.width, theirs.origin.x, theirs.size.width),
-                bounds.origin.y - theirs.size.height - MACHINE_GAP - theirs.origin.y,
-            ),
-            Side::Bottom => (
-                centre_on(bounds.origin.x, bounds.size.width, theirs.origin.x, theirs.size.width),
-                bounds.origin.y + bounds.size.height + MACHINE_GAP - theirs.origin.y,
-            ),
-        };
-        let peers = peers
-            .into_iter()
-            .map(|(r, label)| {
-                (NSRect::new(NSPoint::new(r.origin.x + dx, r.origin.y + dy), r.size), label)
-            })
-            .collect();
+        let peers = state.peers.iter().map(|peer| park(&local, peer)).collect();
         (local, peers)
     }
 
@@ -268,7 +224,7 @@ impl ArrangeView {
 
         let canvas = self.canvas();
         let (local, peers) = self.boxes();
-        let all: Vec<(NSRect, String)> = local.iter().chain(peers.iter()).cloned().collect();
+        let all: Vec<(NSRect, String)> = local.iter().chain(peers.iter().flatten()).cloned().collect();
         let Some(world) = union(&all) else { return };
 
         let scale = ((canvas.size.width - PADDING * 2.0) / world.size.width)
@@ -285,52 +241,63 @@ impl ArrangeView {
             )
         };
 
-        let moved = self.ivars().drag.get();
+        let state = self.ivars();
+        let (moved, dragging) = (state.drag.get(), state.dragging.get());
         let local_view: Vec<(NSRect, String)> =
             local.iter().map(|(r, l)| (place(*r), l.clone())).collect();
-        let peer_view: Vec<(NSRect, String)> = peers
+        let peer_views: Vec<Vec<(NSRect, String)>> = peers
             .iter()
-            .map(|(r, l)| {
-                let r = place(*r);
-                (NSRect::new(NSPoint::new(r.origin.x + moved.x, r.origin.y + moved.y), r.size), l.clone())
+            .enumerate()
+            .map(|(i, group)| {
+                let shift = if dragging == Some(i) { moved } else { NSPoint::new(0.0, 0.0) };
+                group
+                    .iter()
+                    .map(|(r, l)| {
+                        let r = place(*r);
+                        (NSRect::new(NSPoint::new(r.origin.x + shift.x, r.origin.y + shift.y), r.size), l.clone())
+                    })
+                    .collect()
             })
             .collect();
 
-        // Remember where everything ended up, so a drop can be judged.
-        *self.ivars().drawn.borrow_mut() = local_view.iter().map(|(r, _)| *r).collect();
-        if let (Some(mine), Some(theirs)) = (union(&local_view), union(&peer_view)) {
-            self.ivars().centres.set((centre(mine), centre(theirs)));
-            if self.ivars().dragging.get() {
-                let (_, display) = self.landed_on();
-                let target = display
-                    .and_then(|d| local_view.get(d - 1))
-                    .map(|(r, _)| *r)
-                    .unwrap_or(mine);
-                self.show_target(target);
+        // Remember where everything ended up, so a click and a drop can be judged.
+        *state.drawn.borrow_mut() = local_view.iter().map(|(r, _)| *r).collect();
+        *state.groups.borrow_mut() = peer_views.iter().map(|g| union(g).unwrap_or_default()).collect();
+        if let Some(mine) = union(&local_view) {
+            let theirs = peer_views.iter().map(|g| union(g).map_or(centre(mine), centre)).collect();
+            *state.centres.borrow_mut() = (centre(mine), theirs);
+            if let Some(i) = dragging {
+                let (side, display) = self.landed_on(i);
+                let target = display.and_then(|d| local_view.get(d - 1)).map(|(r, _)| *r).unwrap_or(mine);
+                self.show_target(target, side);
             }
         }
 
         for (rect, label) in &local_view {
             self.screen(*rect, label, false);
         }
-        for (rect, label) in &peer_view {
-            self.screen(*rect, label, true);
+        for group in &peer_views {
+            for (rect, label) in group {
+                self.screen(*rect, label, true);
+            }
         }
 
-        // Keep each name clear of the other machine's screens.
-        let side = self.ivars().side.get();
+        // Keep each name clear of the other machines' screens.
+        let above = state.peers.iter().any(|p| p.side.get() == Side::Top);
         if let Some(mine) = union(&local_view) {
-            self.badge(mine, "This Mac", false, side == Side::Top);
+            self.badge(mine, "This Mac", false, above);
         }
-        if let Some(theirs) = union(&peer_view) {
-            self.badge(theirs, &self.ivars().peer_name, true, side == Side::Bottom);
+        for (peer, group) in state.peers.iter().zip(&peer_views) {
+            if let Some(theirs) = union(group) {
+                self.badge(theirs, &peer.name, true, peer.side.get() == Side::Bottom);
+            }
         }
     }
 
     /// While dragging, light up the edge the drop would choose.
-    fn show_target(&self, mine: NSRect) {
+    fn show_target(&self, mine: NSRect, side: Side) {
         let inset = 3.0;
-        let (from, to) = match self.landed_on().0 {
+        let (from, to) = match side {
             Side::Left => (
                 NSPoint::new(mine.origin.x - inset, mine.origin.y),
                 NSPoint::new(mine.origin.x - inset, mine.origin.y + mine.size.height),
@@ -491,6 +458,70 @@ fn text_style(points: f64, colour: Retained<NSColor>) -> Retained<NSDictionary<N
     )
 }
 
+/// A peer's screens moved to rest against the edge it sits on: the display it
+/// belongs to, or the whole desktop. A peer that has not said what it has
+/// gets one stand-in screen.
+fn park(local: &[(NSRect, String)], peer: &PeerView) -> Vec<(NSRect, String)> {
+    let bounds = peer
+        .display
+        .get()
+        .and_then(|d| local.get(d - 1))
+        .map(|(r, _)| *r)
+        .or_else(|| union(local))
+        .unwrap_or(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1440.0, 900.0)));
+    let screens: Vec<(NSRect, String)> = if peer.screens.is_empty() {
+        vec![(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1920.0, 1080.0)), "screen".to_string())]
+    } else {
+        peer.screens.iter().map(|s| (rect_of(s), describe(s))).collect()
+    };
+    let theirs = union(&screens).unwrap_or(bounds);
+    let (dx, dy) = match peer.side.get() {
+        Side::Left => (
+            bounds.origin.x - theirs.size.width - MACHINE_GAP - theirs.origin.x,
+            centre_on(bounds.origin.y, bounds.size.height, theirs.origin.y, theirs.size.height),
+        ),
+        Side::Right => (
+            bounds.origin.x + bounds.size.width + MACHINE_GAP - theirs.origin.x,
+            centre_on(bounds.origin.y, bounds.size.height, theirs.origin.y, theirs.size.height),
+        ),
+        Side::Top => (
+            centre_on(bounds.origin.x, bounds.size.width, theirs.origin.x, theirs.size.width),
+            bounds.origin.y - theirs.size.height - MACHINE_GAP - theirs.origin.y,
+        ),
+        Side::Bottom => (
+            centre_on(bounds.origin.x, bounds.size.width, theirs.origin.x, theirs.size.width),
+            bounds.origin.y + bounds.size.height + MACHINE_GAP - theirs.origin.y,
+        ),
+    };
+    screens
+        .into_iter()
+        .map(|(r, label)| (NSRect::new(NSPoint::new(r.origin.x + dx, r.origin.y + dy), r.size), label))
+        .collect()
+}
+
+/// Where a dropped group belongs: the edge of the nearest of this Mac's drawn
+/// screens that faces it. One display means the whole desktop, said plainly.
+fn judge(drawn: &[NSRect], mine: NSPoint, theirs: NSPoint) -> (Side, Option<usize>) {
+    let nearest = drawn
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| gap(centre(**a), theirs).total_cmp(&gap(centre(**b), theirs)))
+        .map(|(i, r)| (i + 1, centre(*r)));
+    let (display, mine) = match nearest {
+        Some((index, centre)) => (Some(index), centre),
+        None => (None, mine),
+    };
+    let (dx, dy) = (theirs.x - mine.x, theirs.y - mine.y);
+    let side = if dx.abs() >= dy.abs() {
+        if dx > 0.0 { Side::Right } else { Side::Left }
+    } else if dy > 0.0 {
+        Side::Bottom
+    } else {
+        Side::Top
+    };
+    (side, if drawn.len() > 1 { display } else { None })
+}
+
 /// Name over resolution, the way the Displays pane labels them.
 fn describe(screen: &Screen) -> String {
     format!("{}\n{} × {}", screen.name, screen.w, screen.h)
@@ -532,17 +563,14 @@ fn union(boxes: &[(NSRect, String)]) -> Option<NSRect> {
 }
 
 /// Shown along the bottom, because a drag that snaps needs explaining.
-const HINT: &str = "Drag the other machine to the side of this Mac it sits on";
+const HINT: &str = "Drag each machine to the side of this Mac it sits on";
 
 /// Render the window's drawing straight to a PNG, so the design can be looked
 /// at without a screen recording permission or a human with a camera.
 pub fn snapshot(
     mtm: MainThreadMarker,
     local: Vec<Screen>,
-    peer: Vec<Screen>,
-    peer_name: String,
-    side: Side,
-    display: Option<usize>,
+    peers: Vec<PeerView>,
     out: &std::path::Path,
 ) -> anyhow::Result<()> {
     use objc2_app_kit::NSBitmapImageFileType;
@@ -552,14 +580,12 @@ pub fn snapshot(
         mtm,
         ViewState {
             local,
-            peer,
-            peer_name,
-            side: Cell::new(side),
-            display: Cell::new(display),
+            peers,
             drawn: RefCell::new(Vec::new()),
+            groups: RefCell::new(Vec::new()),
             drag: Cell::new(NSPoint::new(0.0, 0.0)),
-            dragging: Cell::new(false),
-            centres: Cell::new((NSPoint::new(0.0, 0.0), NSPoint::new(0.0, 0.0))),
+            dragging: Cell::new(None),
+            centres: RefCell::new((NSPoint::new(0.0, 0.0), Vec::new())),
             control,
             config_path: PathBuf::new(),
         },
@@ -580,10 +606,7 @@ pub fn snapshot(
 pub fn window(
     mtm: MainThreadMarker,
     local: Vec<Screen>,
-    peer: Vec<Screen>,
-    peer_name: String,
-    side: Side,
-    display: Option<usize>,
+    peers: Vec<PeerView>,
     control: UnboundedSender<Control>,
     config_path: PathBuf,
 ) -> Retained<NSWindow> {
@@ -591,14 +614,12 @@ pub fn window(
         mtm,
         ViewState {
             local,
-            peer,
-            peer_name,
-            side: Cell::new(side),
-            display: Cell::new(display),
+            peers,
             drawn: RefCell::new(Vec::new()),
+            groups: RefCell::new(Vec::new()),
             drag: Cell::new(NSPoint::new(0.0, 0.0)),
-            dragging: Cell::new(false),
-            centres: Cell::new((NSPoint::new(0.0, 0.0), NSPoint::new(0.0, 0.0))),
+            dragging: Cell::new(None),
+            centres: RefCell::new((NSPoint::new(0.0, 0.0), Vec::new())),
             control,
             config_path,
         },
@@ -648,5 +669,30 @@ mod tests {
         assert_eq!(centre_on(0.0, 1000.0, 0.0, 200.0), 400.0);
         // Whatever the group's own origin, the offset takes it to the centre.
         assert_eq!(centre_on(0.0, 1000.0, -50.0, 200.0), 450.0);
+    }
+
+    fn rect(x: f64, y: f64, w: f64, h: f64) -> NSRect {
+        NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+    }
+
+    #[test]
+    fn a_drop_lands_on_the_nearest_display_edge() {
+        // Two displays side by side; a group dropped right of the second.
+        let drawn = [rect(0.0, 0.0, 100.0, 60.0), rect(100.0, 0.0, 100.0, 60.0)];
+        assert_eq!(judge(&drawn, NSPoint::new(100.0, 30.0), NSPoint::new(260.0, 30.0)), (Side::Right, Some(2)));
+        // Above the first one.
+        assert_eq!(judge(&drawn, NSPoint::new(100.0, 30.0), NSPoint::new(50.0, -80.0)), (Side::Top, Some(1)));
+        // With one display the edge belongs to the whole desktop.
+        assert_eq!(judge(&drawn[..1], NSPoint::new(50.0, 30.0), NSPoint::new(-90.0, 30.0)), (Side::Left, None));
+    }
+
+    #[test]
+    fn each_peer_parks_on_its_own_edge() {
+        let local = vec![(rect(0.0, 0.0, 1000.0, 600.0), String::new())];
+        let top = PeerView::new("anorak".into(), vec![], Side::Top, None, 0);
+        let right = PeerView::new("anton".into(), vec![], Side::Right, None, 1);
+        let (t, r) = (park(&local, &top)[0].0, park(&local, &right)[0].0);
+        assert_eq!(t.origin.y + t.size.height, 0.0, "anorak sits right above");
+        assert_eq!(r.origin.x, 1000.0, "anton sits right of the Mac");
     }
 }

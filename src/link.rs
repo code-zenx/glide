@@ -56,9 +56,25 @@ const MAX_BULK: usize = crate::clipboard::MAX_IMAGE + (1 << 16);
 #[derive(Default)]
 pub struct Links {
     peers: Mutex<HashMap<String, UnboundedSender<Msg>>>,
+    /// Peers switched off on this server. Read by the clipboard, which must
+    /// not hand a paused machine what was just copied.
+    paused: Mutex<std::collections::HashSet<String>>,
 }
 
 impl Links {
+    pub fn set_paused(&self, peer: &str, paused: bool) {
+        let mut set = self.paused.lock().unwrap();
+        if paused {
+            set.insert(peer.to_string());
+        } else {
+            set.remove(peer);
+        }
+    }
+
+    pub fn is_paused(&self, peer: &str) -> bool {
+        self.paused.lock().unwrap().contains(peer)
+    }
+
     /// Send to one peer. Silently does nothing when that peer is not connected:
     /// input for a machine that just dropped off has nowhere useful to go.
     pub fn send(&self, peer: &str, msg: Msg) {
@@ -460,12 +476,7 @@ async fn serve(
     let started = Instant::now();
     let writer = tokio::spawn(write_loop(conn.clone(), send, rx));
     let pinger = tokio::spawn(ping_loop(tx.clone(), started));
-    status.set(|s| {
-        s.peer = peer.to_string();
-        if s.mode == "offline" {
-            s.mode = "local".into();
-        }
-    });
+    status.set_peer(peer, |p| p.mode = "local".into());
     // Tell the peer what this machine has attached, so its arrange window can
     // draw real screens instead of a placeholder.
     let _ = tx.send(Msg::Screens(crate::screens::local()));
@@ -600,7 +611,7 @@ async fn datagrams(
             _ = report.tick() => {
                 if let Some(line) = samples.summary() {
                     info!(%peer, "{line}");
-                    status.set(|s| s.rtt_ms = samples.p50());
+                    status.set_peer(peer, |p| p.rtt_ms = samples.p50());
                 }
             }
         }
@@ -779,6 +790,7 @@ mod tests {
                 fingerprint: peer.fingerprint(),
                 position: Side::Right,
                 display: None,
+                enabled: true,
             }],
         };
         let sender = endpoint(&config(&id_there, "here"), &id_here)?.endpoint;

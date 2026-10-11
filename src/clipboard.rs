@@ -98,7 +98,7 @@ pub async fn watch(links: Arc<Links>, peers: Vec<String>) {
         };
         if changed {
             debug!("clipboard changed: {}", clip.describe());
-            for peer in &peers {
+            for peer in peers.iter().filter(|p| !links.is_paused(p)) {
                 links.send(peer, Msg::Clipboard(clip.clone()));
             }
         }
