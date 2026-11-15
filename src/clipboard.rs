@@ -81,7 +81,7 @@ pub async fn write(clip: Clip) {
 }
 
 /// Send every local copy to the peers, for as long as the daemon runs.
-pub async fn watch(links: Arc<Links>, peers: Vec<String>) {
+pub async fn watch(links: Arc<Links>) {
     // Whatever is on the clipboard at startup was not copied just now.
     *LAST_SEEN.lock().unwrap() = read().await.map(|clip| clip.fingerprint());
     loop {
@@ -98,8 +98,8 @@ pub async fn watch(links: Arc<Links>, peers: Vec<String>) {
         };
         if changed {
             debug!("clipboard changed: {}", clip.describe());
-            for peer in peers.iter().filter(|p| !links.is_paused(p)) {
-                links.send(peer, Msg::Clipboard(clip.clone()));
+            for peer in links.peers().iter().filter(|p| !links.is_off(&p.name)) {
+                links.send(&peer.name, Msg::Clipboard(clip.clone()));
             }
         }
     }
@@ -122,6 +122,12 @@ fn read_text() -> Option<Clip> {
 }
 
 fn write_text(text: String) {
+    // arboard's X11 clipboard dies with the process' last handle unless a
+    // clipboard manager takes it over; xclip keeps serving on its own.
+    #[cfg(not(target_os = "macos"))]
+    if x11() {
+        return serve("xclip", &["-selection", "clipboard", "-i"], text.as_bytes());
+    }
     if let Err(e) = arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
         debug!("cannot set clipboard text: {e}");
     }
@@ -179,6 +185,12 @@ fn uti_for(mime: &str) -> &'static str {
     }
 }
 
+/// No Wayland means X11 (nullbyte's Xfce), where xclip does the clipboard.
+#[cfg(not(target_os = "macos"))]
+fn x11() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_none()
+}
+
 /// Wayland offers the clipboard by MIME type directly, so the bytes come
 /// across as they are.
 #[cfg(not(target_os = "macos"))]
@@ -186,6 +198,9 @@ fn read_image() -> Option<Clip> {
     use std::io::Read;
     use wl_clipboard_rs::paste::{get_contents, ClipboardType, MimeType, Seat};
 
+    if x11() {
+        return read_image_x11();
+    }
     for mime in IMAGE_TYPES {
         let Ok((mut pipe, _)) =
             get_contents(ClipboardType::Regular, Seat::Unspecified, MimeType::Specific(mime))
@@ -215,11 +230,36 @@ fn read_image() -> Option<Clip> {
 /// into the background and stays until something else is copied.
 #[cfg(not(target_os = "macos"))]
 fn write_image(mime: &str, bytes: Vec<u8>) {
+    if x11() {
+        serve("xclip", &["-selection", "clipboard", "-t", mime, "-i"], &bytes);
+    } else {
+        serve("wl-copy", &["--type", mime], &bytes);
+    }
+}
+
+/// X11 lists what the clipboard holds under the TARGETS target.
+#[cfg(not(target_os = "macos"))]
+fn read_image_x11() -> Option<Clip> {
+    let xclip = |target: &str| {
+        std::process::Command::new("xclip").args(["-selection", "clipboard", "-t", target, "-o"]).output().ok()
+    };
+    let targets = String::from_utf8(xclip("TARGETS")?.stdout).ok()?;
+    let mime = IMAGE_TYPES.into_iter().find(|m| targets.lines().any(|t| t.trim() == *m))?;
+    let bytes = xclip(mime)?.stdout;
+    if bytes.is_empty() || too_big(mime, bytes.len()) {
+        return None;
+    }
+    Some(Clip::Image { mime: mime.to_string(), bytes })
+}
+
+/// Pipe the bytes to a clipboard tool that forks and keeps serving them.
+#[cfg(not(target_os = "macos"))]
+fn serve(program: &str, args: &[&str], bytes: &[u8]) {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    let child = Command::new("wl-copy")
-        .args(["--type", mime])
+    let child = Command::new(program)
+        .args(args)
         .stdin(Stdio::piped())
         // The forked server inherits these; a pipe here would stay open for
         // as long as the image sits on the clipboard.
@@ -229,14 +269,14 @@ fn write_image(mime: &str, bytes: Vec<u8>) {
     let mut child = match child {
         Ok(child) => child,
         Err(e) => {
-            tracing::warn!("cannot run wl-copy for {mime}, is wl-clipboard installed? {e}");
+            tracing::warn!("cannot run {program}, is it installed? {e}");
             return;
         }
     };
-    let written = child.stdin.take().expect("stdin is piped").write_all(&bytes);
+    let written = child.stdin.take().expect("stdin is piped").write_all(bytes);
     match (written, child.wait()) {
         (Ok(()), Ok(status)) if status.success() => {}
-        (written, status) => tracing::warn!("wl-copy did not take {mime}: {written:?} {status:?}"),
+        (written, status) => tracing::warn!("{program} did not take the clipboard: {written:?} {status:?}"),
     }
 }
 

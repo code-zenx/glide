@@ -43,6 +43,10 @@ pub enum Msg {
     /// "I have switched you off" (or back on). The server sends it when its
     /// owner pauses a client; the link stays up so both ends can show it.
     Paused(bool),
+    /// What a client can do, sent once per connection: whether it can show
+    /// the server's extended display (Hyprland can, X11 cannot). A client too
+    /// old to send this is taken to be able.
+    Caps { extend: bool },
 }
 
 /// What the server asks a client's screen to do with its extended display.
@@ -138,6 +142,10 @@ impl Msg {
                 out.push(13);
                 out.push(*on as u8);
             }
+            Msg::Caps { extend } => {
+                out.push(14);
+                out.push(*extend as u8);
+            }
             Msg::Screens(screens) => {
                 out.push(6);
                 out.push(screens.len().min(u8::MAX as usize) as u8);
@@ -192,6 +200,7 @@ impl Msg {
             })),
             12 => Msg::DisplayReady(Err(String::from_utf8_lossy(rest).into_owned())),
             13 => Msg::Paused(*rest.first().context("no paused flag")? != 0),
+            14 => Msg::Caps { extend: *rest.first().context("no extend flag")? != 0 },
             _ => bail!("unknown message tag {tag}"),
         })
     }
@@ -367,5 +376,13 @@ mod tests {
             assert_eq!(msg.route(), Route::Stream, "a pause must arrive");
         }
         assert!(Msg::decode(&[13]).is_err(), "no flag is refused, not guessed");
+    }
+
+    #[test]
+    fn caps_cross_intact() {
+        for extend in [true, false] {
+            let msg = Msg::Caps { extend };
+            assert_eq!(Msg::decode(&msg.encode()).unwrap(), msg);
+        }
     }
 }

@@ -15,7 +15,8 @@
 //! buffer; sharing them with thirty megabits a second of video would put every
 //! key press in the queue behind it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -38,6 +39,17 @@ use crate::{Config, Peer};
 
 const ALPN: &[u8] = b"glide/0";
 const VIDEO_ALPN: &[u8] = b"glide-video/0";
+/// `glide join`: a machine that is not trusted yet, presenting an invite.
+const PAIR_ALPN: &[u8] = b"glide-pair/0";
+/// Close code for "this server switched you off". The client stops dialing
+/// and shows it; the server dials again when switched back on.
+pub const OFF: u32 = 1;
+/// Close code for "this server forgot you".
+pub const FORGOTTEN: u32 = 2;
+/// How often a client the server switched off checks whether it is back on,
+/// in case the server cannot reach it (new DHCP lease, inbound port blocked).
+const OFF_PROBE: Duration = Duration::from_secs(60);
+const DIAL_EVERY: Duration = Duration::from_secs(2);
 /// How much unacknowledged video may sit in the send buffer: a keyframe and a
 /// little. More only lets latency pile up inside quinn, out of sight of the
 /// frame dropping that is meant to stop exactly that.
@@ -52,27 +64,93 @@ const MAX_FRAME: usize = 1 << 16;
 /// A clipboard item, which arrives on a stream of its own.
 const MAX_BULK: usize = crate::clipboard::MAX_IMAGE + (1 << 16);
 
-/// Every peer this machine can currently talk to, by name.
+/// Every peer this machine knows, and the ones it can currently talk to.
 #[derive(Default)]
 pub struct Links {
     peers: Mutex<HashMap<String, UnboundedSender<Msg>>>,
-    /// Peers switched off on this server. Read by the clipboard, which must
-    /// not hand a paused machine what was just copied.
-    paused: Mutex<std::collections::HashSet<String>>,
+    conns: Mutex<HashMap<String, Connection>>,
+    /// The configured peers, kept current as devices are paired and forgotten,
+    /// so dialing, certificate checks and the clipboard all see the same list.
+    roster: Mutex<Vec<Peer>>,
+    /// Off. On a server: switched off by its owner, never dialed, refused.
+    /// On a client: the server said so; dialed only once a minute to check.
+    off: Mutex<HashSet<String>>,
+    server: bool,
 }
 
 impl Links {
-    pub fn set_paused(&self, peer: &str, paused: bool) {
-        let mut set = self.paused.lock().unwrap();
-        if paused {
+    pub fn new(peers: Vec<Peer>, server: bool) -> Self {
+        let off = peers.iter().filter(|p| server && !p.enabled).map(|p| p.name.clone()).collect();
+        Self { roster: Mutex::new(peers), off: Mutex::new(off), server, ..Default::default() }
+    }
+
+    pub fn set_off(&self, peer: &str, off: bool) {
+        let mut set = self.off.lock().unwrap();
+        if off {
             set.insert(peer.to_string());
         } else {
             set.remove(peer);
         }
     }
 
-    pub fn is_paused(&self, peer: &str) -> bool {
-        self.paused.lock().unwrap().contains(peer)
+    pub fn is_off(&self, peer: &str) -> bool {
+        self.off.lock().unwrap().contains(peer)
+    }
+
+    pub fn peers(&self) -> Vec<Peer> {
+        self.roster.lock().unwrap().clone()
+    }
+
+    pub fn peer(&self, name: &str) -> Option<Peer> {
+        self.roster.lock().unwrap().iter().find(|p| p.name == name).cloned()
+    }
+
+    /// A newly paired device, or a re-paired one replacing its old entry. A
+    /// link under the old certificate is closed: it no longer proves anything.
+    pub fn upsert(&self, peer: Peer) {
+        let mut roster = self.roster.lock().unwrap();
+        match roster.iter_mut().find(|p| p.name == peer.name) {
+            Some(old) => {
+                let rekeyed = old.fingerprint != peer.fingerprint;
+                *old = peer.clone();
+                drop(roster);
+                if rekeyed {
+                    self.disconnect(&peer.name, FORGOTTEN);
+                }
+            }
+            None => roster.push(peer),
+        }
+    }
+
+    pub fn forget(&self, name: &str) {
+        self.roster.lock().unwrap().retain(|p| p.name != name);
+        self.set_off(name, false);
+        self.disconnect(name, FORGOTTEN);
+    }
+
+    /// Close the link to a peer now, telling it why.
+    pub fn disconnect(&self, name: &str, code: u32) {
+        if let Some(conn) = self.conns.lock().unwrap().remove(name) {
+            conn.close(code.into(), if code == OFF { b"turned off" } else { b"forgotten" });
+        }
+    }
+
+    /// Put the address a peer just connected from first in its list. True when
+    /// that changed anything, so the caller can save it.
+    fn note_addr(&self, name: &str, addr: SocketAddr) -> bool {
+        let mut roster = self.roster.lock().unwrap();
+        let Some(peer) = roster.iter_mut().find(|p| p.name == name) else { return false };
+        if peer.addrs.first() == Some(&addr) {
+            return false;
+        }
+        peer.addrs.retain(|a| *a != addr);
+        peer.addrs.insert(0, addr);
+        peer.addrs.truncate(4);
+        true
+    }
+
+    fn trusts(&self, seen: &[u8; 32]) -> bool {
+        self.roster.lock().unwrap().iter().any(|p| parse_fingerprint(&p.fingerprint).is_ok_and(|f| f == *seen))
     }
 
     /// Send to one peer. Silently does nothing when that peer is not connected:
@@ -103,6 +181,7 @@ impl Links {
 
     fn unregister(&self, peer: &str) {
         self.peers.lock().unwrap().remove(peer);
+        self.conns.lock().unwrap().remove(peer);
     }
 }
 
@@ -167,18 +246,26 @@ fn parse_fingerprint(text: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-/// Accepts exactly the certificates whose fingerprints we were told to expect,
-/// in both directions: a peer proves who it is by its key, not by a CA.
-#[derive(Debug)]
+/// Accepts exactly the certificates of the peers in the roster, in both
+/// directions: a peer proves who it is by its key, not by a CA. The one
+/// exception is a machine connecting *to* us while an invite is open: it may
+/// finish the handshake, but anything other than the pairing ALPN still drops
+/// it in `identify`.
 struct Pinned {
-    expected: Vec<[u8; 32]>,
+    links: Arc<Links>,
     provider: Arc<rustls::crypto::CryptoProvider>,
 }
 
+impl std::fmt::Debug for Pinned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Pinned")
+    }
+}
+
 impl Pinned {
-    fn check(&self, cert: &CertificateDer<'_>) -> Result<(), rustls::Error> {
+    fn check(&self, cert: &CertificateDer<'_>, incoming: bool) -> Result<(), rustls::Error> {
         let seen: [u8; 32] = Sha256::digest(cert).into();
-        if self.expected.contains(&seen) {
+        if self.links.trusts(&seen) || (incoming && crate::pair::open()) {
             Ok(())
         } else {
             Err(rustls::Error::General(format!("unknown peer certificate {}", hex(&seen))))
@@ -203,7 +290,7 @@ impl ServerCertVerifier for Pinned {
         _ocsp: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        self.check(end_entity)?;
+        self.check(end_entity, false)?;
         Ok(ServerCertVerified::assertion())
     }
 
@@ -231,7 +318,7 @@ impl ClientCertVerifier for Pinned {
         _intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
-        self.check(end_entity)?;
+        self.check(end_entity, true)?;
         Ok(ClientCertVerified::assertion())
     }
 
@@ -271,21 +358,21 @@ impl Net {
     }
 }
 
-pub fn endpoint(config: &Config, identity: &Identity) -> Result<Net> {
+pub fn endpoint(config: &Config, identity: &Identity, links: Arc<Links>) -> Result<Net> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let expected: Vec<[u8; 32]> = config
-        .peers
-        .iter()
-        .map(|p| parse_fingerprint(&p.fingerprint).with_context(|| format!("peer {}", p.name)))
-        .collect::<Result<_>>()?;
-    let pinned = Arc::new(Pinned { expected, provider: provider.clone() });
+    // A typo in a fingerprint should stop the daemon loudly, not just make
+    // that peer silently unreachable.
+    for p in &config.peers {
+        parse_fingerprint(&p.fingerprint).with_context(|| format!("peer {}", p.name))?;
+    }
+    let pinned = Arc::new(Pinned { links, provider: provider.clone() });
 
     let (certs, key) = identity.clone_parts();
     let mut server_crypto = rustls::ServerConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(pinned.clone())
         .with_single_cert(certs, key)?;
-    server_crypto.alpn_protocols = vec![ALPN.to_vec(), VIDEO_ALPN.to_vec()];
+    server_crypto.alpn_protocols = vec![ALPN.to_vec(), VIDEO_ALPN.to_vec(), PAIR_ALPN.to_vec()];
 
     let (certs, key) = identity.clone_parts();
     let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider)
@@ -321,111 +408,189 @@ pub fn endpoint(config: &Config, identity: &Identity) -> Result<Net> {
     Ok(Net { endpoint, video })
 }
 
+/// What `glide join` dials with: its own certificate, the server pinned to the
+/// fingerprint in the invite, the pairing ALPN, and a throwaway port so a
+/// daemon already running here keeps its own.
+pub fn pair_endpoint(identity: &Identity, server: Peer) -> Result<Endpoint> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let pinned = Arc::new(Pinned { links: Arc::new(Links::new(vec![server], false)), provider: provider.clone() });
+    let (certs, key) = identity.clone_parts();
+    let mut crypto = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])?
+        .dangerous()
+        .with_custom_certificate_verifier(pinned)
+        .with_client_auth_cert(certs, key)?;
+    crypto.alpn_protocols = vec![PAIR_ALPN.to_vec()];
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(Duration::from_secs(10).try_into()?));
+    let mut config = quinn::ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?));
+    config.transport_config(Arc::new(transport));
+    let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+    endpoint.set_default_client_config(config);
+    Ok(endpoint)
+}
+
+/// The certificate fingerprint a connected peer presented.
+pub(crate) fn peer_fingerprint(conn: &Connection) -> Option<String> {
+    let certs = conn.peer_identity()?.downcast::<Vec<CertificateDer<'static>>>().ok()?;
+    Some(hex(&Sha256::digest(certs.first()?)))
+}
+
 /// Listen for peers, dial the ones we are responsible for, and keep both going.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     config: Config,
+    config_path: PathBuf,
     net: Net,
     links: Arc<Links>,
     status: Arc<Status>,
     to_session: UnboundedSender<(String, Msg)>,
     link_state: UnboundedSender<(String, bool)>,
     video_in: UnboundedSender<(String, Connection)>,
+    control: UnboundedSender<crate::input::Control>,
 ) -> Result<()> {
     let endpoint = net.endpoint;
     info!(listen = %config.listen, name = %config.name, role = ?config.role, "glide up");
 
     // Both machines dial each other; whichever connection lands first is the
     // one that gets used. One end being firewalled costs nothing this way.
-    for peer in config.peers.clone() {
-        tokio::spawn(dial_forever(
-            endpoint.clone(),
-            peer,
-            links.clone(),
-            status.clone(),
-            to_session.clone(),
-            link_state.clone(),
-        ));
-    }
+    tokio::spawn(dial_loop(endpoint.clone(), links.clone(), status.clone(), to_session.clone(), link_state.clone()));
 
+    let server = config.role == crate::Role::Server;
     while let Some(incoming) = endpoint.accept().await {
-        let (peers, links, to_session) = (config.peers.clone(), links.clone(), to_session.clone());
-        let (status, link_state, video_in) = (status.clone(), link_state.clone(), video_in.clone());
+        let (links, to_session, config_path) = (links.clone(), to_session.clone(), config_path.clone());
+        let (status, link_state, video_in, control) = (status.clone(), link_state.clone(), video_in.clone(), control.clone());
+        let me = config.name.clone();
         tokio::spawn(async move {
             let conn = match incoming.await {
                 Ok(conn) => conn,
                 Err(e) => return warn!("rejected connection: {e}"),
             };
+            if alpn(&conn).as_deref() == Some(PAIR_ALPN) {
+                if server {
+                    crate::pair::accept(conn, &me, &links, &config_path, &control, &status).await;
+                } else {
+                    conn.close(0u32.into(), b"not a server");
+                }
+                return;
+            }
             // The pinned certificate already proved who this is; the name just
-            // tells us which screen edge the events belong to.
-            let Some(name) = identify(&conn, &peers) else {
+            // tells us which screen edge the events belong to. A certificate
+            // let through only because an invite is open stops here.
+            let Some(name) = identify(&conn, &links.peers()) else {
                 return warn!(addr = %conn.remote_address(), "connected peer is not in the config");
             };
-            if is_video(&conn) {
+            if alpn(&conn).as_deref() == Some(VIDEO_ALPN) {
                 info!(peer = %name, "extended display connected");
                 let _ = video_in.send((name, conn));
                 return;
             }
+            // Wherever it came from is where it can be reached now, which
+            // keeps a peer on a DHCP lease reachable after the lease moves.
+            if links.note_addr(&name, conn.remote_address()) {
+                info!(peer = %name, addr = %conn.remote_address(), "peer has a new address");
+                if let Err(e) = crate::set_peer_addrs(&config_path, &name, links.peer(&name).map(|p| p.addrs).unwrap_or_default()) {
+                    warn!(peer = %name, "cannot save its address: {e}");
+                }
+            }
             info!(peer = %name, addr = %conn.remote_address(), "peer connected");
-            if let Err(e) = serve(conn, &name, false, &links, &status, &to_session, &link_state).await {
+            if let Err(e) = serve(conn.clone(), &name, false, &links, &status, &to_session, &link_state).await {
                 warn!(peer = %name, "link closed: {e}");
             }
+            check_told_off(&conn, &name, &links, &status);
         });
     }
     endpoint.wait_idle().await;
     Ok(())
 }
 
-pub(crate) fn is_video(conn: &Connection) -> bool {
+fn alpn(conn: &Connection) -> Option<Vec<u8>> {
     conn.handshake_data()
         .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
         .and_then(|data| data.protocol)
-        .is_some_and(|alpn| alpn == VIDEO_ALPN)
+}
+
+#[cfg(test)]
+pub(crate) fn is_video(conn: &Connection) -> bool {
+    alpn(conn).as_deref() == Some(VIDEO_ALPN)
 }
 
 fn identify(conn: &Connection, peers: &[Peer]) -> Option<String> {
-    let certs = conn.peer_identity()?.downcast::<Vec<CertificateDer<'static>>>().ok()?;
-    let seen = hex(&Sha256::digest(certs.first()?));
+    let seen = peer_fingerprint(conn)?;
     peers
         .iter()
         .find(|p| parse_fingerprint(&p.fingerprint).is_ok_and(|f| hex(&f) == seen))
         .map(|p| p.name.clone())
 }
 
-async fn dial_forever(
+/// A client whose server closed the link with [`OFF`] is switched off: it says
+/// so and stops dialing until the server comes back for it.
+fn check_told_off(conn: &Connection, peer: &str, links: &Links, status: &Status) {
+    if links.server {
+        return;
+    }
+    let off = matches!(conn.close_reason(), Some(quinn::ConnectionError::ApplicationClosed(c)) if c.error_code == quinn::VarInt::from_u32(OFF));
+    if off && !links.is_off(peer) {
+        info!(%peer, "turned off by {peer}");
+    }
+    if off {
+        links.set_off(peer, true);
+        status.set_peer(peer, |p| p.mode = "off".into());
+    }
+}
+
+/// One loop for every peer, reading the roster each round, so a paired device
+/// is dialed within seconds and a forgotten or switched-off one stops being.
+async fn dial_loop(
     endpoint: Endpoint,
-    peer: Peer,
     links: Arc<Links>,
     status: Arc<Status>,
     to_session: UnboundedSender<(String, Msg)>,
     link_state: UnboundedSender<(String, bool)>,
 ) {
+    let busy: Arc<Mutex<HashSet<String>>> = Arc::default();
     // Say why once, loudly: an unreachable peer is usually a firewall or a
     // missing Local Network permission, and silence there is hard to debug.
-    let mut complained = false;
+    let complained: Arc<Mutex<HashSet<String>>> = Arc::default();
+    let mut probed: HashMap<String, Instant> = HashMap::new();
     loop {
-        // The peer may have dialed us first. Leave that link alone instead of
-        // building a second one every couple of seconds.
-        if links.connected(&peer.name) {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            continue;
-        }
-        match dial(&endpoint, &peer).await {
-            Ok(conn) => {
-                info!(peer = %peer.name, addr = %conn.remote_address(), "connected");
-                complained = false;
-                if let Err(e) =
-                    serve(conn, &peer.name, true, &links, &status, &to_session, &link_state).await
-                {
-                    warn!(peer = %peer.name, "link closed: {e}");
+        for peer in links.peers() {
+            // The peer may have dialed us first. Leave that link alone instead
+            // of building a second one every couple of seconds.
+            if links.connected(&peer.name) || busy.lock().unwrap().contains(&peer.name) {
+                continue;
+            }
+            if links.is_off(&peer.name) {
+                if links.server {
+                    continue;
                 }
+                if probed.get(&peer.name).is_some_and(|t| t.elapsed() < OFF_PROBE) {
+                    continue;
+                }
+                probed.insert(peer.name.clone(), Instant::now());
             }
-            Err(e) if !complained => {
-                complained = true;
-                warn!(peer = %peer.name, "cannot reach: {e}");
-            }
-            Err(e) => debug!(peer = %peer.name, "cannot reach: {e}"),
+            busy.lock().unwrap().insert(peer.name.clone());
+            let (endpoint, links, status) = (endpoint.clone(), links.clone(), status.clone());
+            let (to_session, link_state, busy, complained) = (to_session.clone(), link_state.clone(), busy.clone(), complained.clone());
+            tokio::spawn(async move {
+                match dial(&endpoint, &peer).await {
+                    Ok(conn) => {
+                        info!(peer = %peer.name, addr = %conn.remote_address(), "connected");
+                        complained.lock().unwrap().remove(&peer.name);
+                        if let Err(e) = serve(conn.clone(), &peer.name, true, &links, &status, &to_session, &link_state).await {
+                            warn!(peer = %peer.name, "link closed: {e}");
+                        }
+                        check_told_off(&conn, &peer.name, &links, &status);
+                    }
+                    Err(e) if complained.lock().unwrap().insert(peer.name.clone()) => {
+                        warn!(peer = %peer.name, "cannot reach: {e}");
+                    }
+                    Err(e) => debug!(peer = %peer.name, "cannot reach: {e}"),
+                }
+                busy.lock().unwrap().remove(&peer.name);
+            });
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(DIAL_EVERY).await;
     }
 }
 
@@ -452,6 +617,16 @@ async fn serve(
     to_session: &UnboundedSender<(String, Msg)>,
     link_state: &UnboundedSender<(String, bool)>,
 ) -> Result<()> {
+    // Switched off on this server, or forgotten while the connection was
+    // being made: say so and hang up.
+    if links.server && links.is_off(peer) {
+        conn.close(OFF.into(), b"turned off");
+        return Ok(());
+    }
+    if links.peer(peer).is_none() {
+        conn.close(FORGOTTEN.into(), b"forgotten");
+        return Ok(());
+    }
     // open_bi only reaches the peer once something is written, so the dialer
     // sends an empty frame to get the stream accepted on the other side.
     let (mut send, recv) = if dialer {
@@ -467,6 +642,11 @@ async fn serve(
     if !links.try_register(peer, tx.clone()) {
         debug!(%peer, "already linked, dropping the duplicate connection");
         return Ok(());
+    }
+    links.conns.lock().unwrap().insert(peer.to_string(), conn.clone());
+    if !links.server {
+        // The server came back for us, so it has switched us on again.
+        links.set_off(peer, false);
     }
 
     // The session arms its screen edge on this and drops it again below. An
@@ -493,6 +673,9 @@ async fn serve(
     };
 
     status.offline(peer);
+    if links.is_off(peer) {
+        status.set_peer(peer, |p| p.mode = "off".into());
+    }
     links.unregister(peer);
     let _ = link_state.send((peer.to_string(), false));
     pinger.abort();
@@ -760,6 +943,44 @@ mod tests {
         assert!(matches!(Msg::Ping(0).route(), Route::Datagram));
     }
 
+    /// Off means off: a server refuses a switched-off device's link with a
+    /// reason, and the device learns it is off instead of retrying blindly.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_switched_off_device_is_refused_and_told_why() -> Result<()> {
+        use crate::{Role, Side};
+        let dir = std::env::temp_dir().join(format!("glide-off-{}", std::process::id()));
+        let (id_server, id_client) = (Identity::load_or_create(&dir.join("s"))?, Identity::load_or_create(&dir.join("c"))?);
+        let config = |peer: &Identity, role, enabled| Config {
+            name: "me".into(),
+            role,
+            listen: "127.0.0.1:0".parse().unwrap(),
+            display: Default::default(),
+            peers: vec![Peer { name: "peer".into(), addrs: vec![], fingerprint: peer.fingerprint(), position: Side::Right, display: None, enabled }],
+        };
+        let (server_cfg, client_cfg) = (config(&id_client, Role::Server, false), config(&id_server, Role::Client, true));
+        let server_links = Arc::new(Links::new(server_cfg.peers.clone(), true));
+        let client_links = Arc::new(Links::new(client_cfg.peers.clone(), false));
+        assert!(server_links.is_off("peer"), "enabled = false in the config reads as off");
+        let server = endpoint(&server_cfg, &id_server, server_links.clone())?.endpoint;
+        let client = endpoint(&client_cfg, &id_client, client_links.clone())?.endpoint;
+        let status = Status::at(dir.join("status"));
+        let (to_session, _inbox) = unbounded_channel();
+        let (linked, _states) = unbounded_channel();
+
+        let (accepted, dialed) = tokio::join!(
+            async { server.accept().await.unwrap().await.unwrap() },
+            async { client.connect(server.local_addr().unwrap(), "glide").unwrap().await.unwrap() },
+        );
+        serve(accepted, "peer", false, &server_links, &status, &to_session, &linked).await?;
+        assert!(!server_links.connected("peer"), "the server never registers it");
+        let _ = serve(dialed.clone(), "peer", true, &client_links, &status, &to_session, &linked).await;
+        check_told_off(&dialed, "peer", &client_links, &status);
+        assert!(client_links.is_off("peer"), "the client knows it was switched off");
+        assert_eq!(status.snapshot().peers[0].mode, "off");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
     /// The bug this whole split exists for. A clipboard image spans thousands
     /// of packets, so while it was framed on the input stream every ping that
     /// landed mid-frame cancelled a `read_exact` that had already swallowed
@@ -793,11 +1014,13 @@ mod tests {
                 enabled: true,
             }],
         };
-        let sender = endpoint(&config(&id_there, "here"), &id_here)?.endpoint;
-        let receiver = endpoint(&config(&id_here, "there"), &id_there)?.endpoint;
+        let (cfg_here, cfg_there) = (config(&id_there, "here"), config(&id_here, "there"));
+        let out = Arc::new(Links::new(cfg_here.peers.clone(), false));
+        let links = Arc::new(Links::new(cfg_there.peers.clone(), false));
+        let sender = endpoint(&cfg_here, &id_here, out.clone())?.endpoint;
+        let receiver = endpoint(&cfg_there, &id_there, links.clone())?.endpoint;
         let addr = receiver.local_addr()?;
 
-        let links = Arc::new(Links::default());
         let (to_session, mut inbox) = unbounded_channel();
         let (unused, _drop) = unbounded_channel();
         let (linked, mut link_state) = unbounded_channel();
@@ -817,7 +1040,6 @@ mod tests {
                 let _ = serve(accepted, "peer", false, &links, &status, &to_session, &linked).await;
             }
         });
-        let out = Arc::new(Links::default());
         let dialing = tokio::spawn({
             let (out, status, linked) = (out.clone(), status.clone(), linked.clone());
             async move {

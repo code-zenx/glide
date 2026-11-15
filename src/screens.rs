@@ -75,8 +75,15 @@ pub fn local() -> Vec<Screen> {
 }
 
 /// Hyprland already knows the layout; asking it beats talking Wayland again.
+/// Anything else (nullbyte's Xfce) is X11, where xrandr knows.
 #[cfg(not(target_os = "macos"))]
 pub fn local() -> Vec<Screen> {
+    let hyprland = hyprland();
+    if hyprland.is_empty() { xrandr() } else { hyprland }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn hyprland() -> Vec<Screen> {
     let output = std::process::Command::new("hyprctl").args(["-j", "monitors"]).output();
     let Ok(output) = output else { return Vec::new() };
     let Ok(monitors) = serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout) else {
@@ -92,6 +99,25 @@ pub fn local() -> Vec<Screen> {
             h: m["height"].as_u64().unwrap_or(0) as u32,
         })
         .collect()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn xrandr() -> Vec<Screen> {
+    let Ok(output) = std::process::Command::new("xrandr").arg("--listmonitors").output() else { return Vec::new() };
+    String::from_utf8_lossy(&output.stdout).lines().skip(1).filter_map(xrandr_monitor).collect()
+}
+
+/// One line of `xrandr --listmonitors`: ` 0: +*HDMI-1 1920/528x1080/297+0+0  HDMI-1`.
+#[cfg(not(target_os = "macos"))]
+fn xrandr_monitor(line: &str) -> Option<Screen> {
+    let mut parts = line.split_whitespace();
+    let geometry = parts.nth(2)?;
+    let name = parts.last()?.to_string();
+    let (size, at) = geometry.split_once('+')?;
+    let (w, h) = size.split_once('x')?;
+    let (x, y) = at.split_once('+')?;
+    let pixels = |s: &str| s.split('/').next()?.parse().ok();
+    Some(Screen { name, x: x.parse().ok()?, y: y.parse().ok()?, w: pixels(w)?, h: pixels(h)? })
 }
 
 #[cfg(test)]
@@ -117,6 +143,14 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn xrandr_lines_parse() {
+        let screen = xrandr_monitor(" 1: +eDP-1 1920/309x1080/173+-1920+0  eDP-1").unwrap();
+        assert_eq!(screen, Screen { name: "eDP-1".into(), x: -1920, y: 0, w: 1920, h: 1080 });
+        assert!(xrandr_monitor("Monitors: 2").is_none());
+    }
+
     #[test]
     fn every_screen_reported_is_one_that_could_be_drawn() {
         let screens = local();
@@ -125,7 +159,9 @@ mod tests {
         // there is no compositor and reporting nothing is the right answer;
         // where there is one, a machine with no screen would make the arrange
         // window lie.
-        let session = cfg!(target_os = "macos") || std::env::var_os("WAYLAND_DISPLAY").is_some();
+        let session = cfg!(target_os = "macos")
+            || std::env::var_os("WAYLAND_DISPLAY").is_some()
+            || std::env::var_os("DISPLAY").is_some();
         assert!(!session || !screens.is_empty(), "a machine with a display must report one");
     }
 }

@@ -65,52 +65,50 @@ cargo build --release
 install -Dm755 target/release/glide ~/.local/bin/glide
 ```
 
-### 2. Create a config
+### 2. Create the server's config
 
-Run these from the `glide` folder. If you downloaded glide, use
-`/Applications/Glide.app/Contents/MacOS/glide` on the Mac and `glide` on Linux instead.
-
-```sh
-./target/release/glide init --name mymac --role server    # on the Mac
-./target/release/glide init --name mybox --role client    # on Linux
-```
-
-Then print each machine's fingerprint and write it down:
+Run this on the Mac, from the `glide` folder (or use
+`/Applications/Glide.app/Contents/MacOS/glide` if you downloaded glide):
 
 ```sh
-./target/release/glide fingerprint
+./target/release/glide init --name mymac --role server
 ```
 
-### 3. Tell each machine about the other
+### 3. Pair each Linux machine
 
-Edit `~/.config/glide/config.toml` on both machines. Each one lists the *other*
-machine.
+Open Glide on the Mac, click **Add Device…** in its menu, and paste the copied
+command into a terminal on the Linux machine:
 
-On the Mac:
+```sh
+glide join glide1+mymac+192.168.1.20:4242+<fingerprint>+<secret>
+```
+
+That creates the Linux machine's config and certificate, and the Mac adds it
+on a free screen edge. No restart is needed. An invite works once and expires after ten
+minutes. `glide invite` on the Mac prints the same command, for when you are
+working over ssh. Pair as many machines as you like.
+
+The Mac's menu lists every device. Each device's submenu turns it **On** or
+**Off**: Off closes the connection, so nothing reaches it. The submenu also
+makes the device the **extended display** (Hyprland only), or **forgets** it.
+From a terminal, use `glide ctl peer on|off|forget <name>` and
+`glide ctl extend <name>|off`.
+
+<details><summary>Pairing by hand instead</summary>
+
+Run `glide init --name mybox --role client` on Linux. Then add each machine
+to the other's `~/.config/glide/config.toml`, using `glide fingerprint` from
+each:
 
 ```toml
-name = "mymac"
-role = "server"
-
 [[peer]]
 name = "mybox"
-addrs = ["192.168.1.50:4242"]           # the Linux box's IP
-position = "top"                        # Linux sits above the Mac
-fingerprint = "<fingerprint from Linux>"
+addrs = ["192.168.1.50:4242"]
+position = "top"                        # the client's side lists the opposite
+fingerprint = "<fingerprint from the other machine>"
 ```
 
-On Linux:
-
-```toml
-name = "mybox"
-role = "client"
-
-[[peer]]
-name = "mymac"
-addrs = ["192.168.1.20:4242"]           # the Mac's IP
-position = "bottom"                     # always the opposite side
-fingerprint = "<fingerprint from the Mac>"
-```
+</details>
 
 ### 4. Run
 
@@ -122,7 +120,7 @@ System Settings → Privacy & Security:
 - Accessibility (called "Device Control and Data Access" on macOS 27)
 - Local Network
 
-**Linux:** start it with your Hyprland session. Copy the service file:
+**Linux:** start it with your session. Copy the service file:
 
 ```sh
 cp contrib/glide.service ~/.config/systemd/user/
@@ -136,7 +134,16 @@ exec-once = systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR 
 exec-once = systemctl --user start glide.service
 ```
 
+On Xfce or another X11 desktop, add an autostart entry whose command is
+`sh -c "systemctl --user import-environment DISPLAY XAUTHORITY && systemctl --user restart glide.service"`.
+Building for X11 needs `libxtst-dev` (and GStreamer's dev packages, as on Wayland). To show the
+glide badge in Xfce's top bar, follow the steps at the top of `contrib/glide-genmon.sh`.
+
 That's it. Push the cursor off the edge and it moves to the other machine.
+
+No mouse needed: on a Mac server, press and let go of Ctrl+Option+Cmd to send the keyboard and
+mouse across while the cursor stays put. Press the same keys to bring them back. If the other
+machine stops answering, Ctrl+Shift+Option+Cmd takes them back at once.
 
 ## Arranging screens
 

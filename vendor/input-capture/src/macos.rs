@@ -63,6 +63,8 @@ struct InputCaptureState {
     only_display: Option<usize>,
     /// current state of modifier keys
     modifier_state: XMods,
+    /// glide: the toggle chord is down, waiting for its keys to be let go.
+    chord_armed: bool,
 }
 
 #[derive(Debug)]
@@ -84,6 +86,7 @@ impl InputCaptureState {
             bounds: Bounds::default(),
             only_display: None,
             modifier_state: Default::default(),
+            chord_armed: false,
         };
         res.update_bounds()?;
         Ok(res)
@@ -146,6 +149,15 @@ impl InputCaptureState {
         }
     }
 
+    /// glide: the edge the toggle chord goes through.
+    // ponytail: first armed edge wins, cycle through them once a server has
+    // several peers.
+    fn send_position(&self) -> Option<Position> {
+        [Position::Left, Position::Right, Position::Top, Position::Bottom]
+            .into_iter()
+            .find(|p| self.active_clients.contains(p))
+    }
+
     /// start the input capture by
     fn start_capture(&mut self, event: &CGEvent, position: Position) -> Result<(), CaptureError> {
         let mut location = event.location();
@@ -187,6 +199,10 @@ impl InputCaptureState {
                     self.show_cursor()?;
                     self.current_pos = None;
                 }
+                // glide: keys let go from here on are not seen, so whatever
+                // was held would read as still held on the next capture.
+                self.modifier_state = XMods::empty();
+                self.chord_armed = false;
             }
             ProducerEvent::Grab(pos) => {
                 if self.current_pos.is_none() {
@@ -234,6 +250,40 @@ impl InputCaptureState {
         };
         Ok(())
     }
+}
+
+/// glide: the chord that toggles input between the machines without touching
+/// the mouse: Ctrl+Option+Cmd.
+fn toggle_chord_flags() -> CGEventFlags {
+    CGEventFlags::CGEventFlagControl
+        | CGEventFlags::CGEventFlagAlternate
+        | CGEventFlags::CGEventFlagCommand
+}
+
+/// glide: true when the toggle chord was just pressed and let go. It fires on
+/// the last key up, so whichever machine has the keyboard sees every modifier
+/// released. Adding Shift cancels it: that is the session's emergency release.
+fn toggle_chord(armed: &mut bool, event_type: &CGEventType, flags: CGEventFlags) -> bool {
+    let held = flags & (toggle_chord_flags() | CGEventFlags::CGEventFlagShift);
+    match event_type {
+        CGEventType::FlagsChanged if held == toggle_chord_flags() => {
+            *armed = true;
+            false
+        }
+        CGEventType::FlagsChanged if held.contains(CGEventFlags::CGEventFlagShift) => {
+            *armed = false;
+            false
+        }
+        CGEventType::FlagsChanged if held.is_empty() => std::mem::take(armed),
+        _ => false,
+    }
+}
+
+/// glide: where the cursor is now. A keyboard event's own location is not
+/// documented, so ask for a fresh event's.
+fn cursor_location() -> Option<CGPoint> {
+    let source = CGEventSource::new(CGEventSourceStateID::CombinedSessionState).ok()?;
+    Some(CGEvent::new(source).ok()?.location())
 }
 
 fn get_events(
@@ -520,6 +570,8 @@ fn create_event_tap<'a>(
             return CallbackResult::Keep;
         }
 
+        let toggled = toggle_chord(&mut state.chord_armed, &event_type, cg_ev.get_flags());
+
         // Are we in a client?
         if let Some(current_pos) = state.current_pos {
             capture_position = Some(current_pos);
@@ -543,10 +595,29 @@ fn create_event_tap<'a>(
             ) {
                 state.reset_cursor().unwrap_or_else(|e| log::warn!("{e}"));
             }
+            // glide: after the key up above, so the peer sees it let go too.
+            if toggled {
+                res_events.push(CaptureEvent::Toggle);
+            }
+        } else if toggled {
+            // glide: the cursor stays put and comes back where it was. Nothing
+            // armed (no link, paused, extending) means there is nowhere to go.
+            if let (Some(new_pos), Some(here)) = (state.send_position(), cursor_location()) {
+                state.enter_position = Some(here);
+                if let Err(e) = notify_tx.try_send(ProducerEvent::Grab(new_pos)) {
+                    log::error!("cannot hide the cursor: {e}");
+                }
+                // Sent here, not through capture_position: this event is the
+                // last modifier going up, and this machine has to see it.
+                if let Err(e) = event_tx.try_send((new_pos, CaptureEvent::Begin)) {
+                    log::error!("cannot start capture: {e}");
+                }
+            }
         } else if matches!(event_type, CGEventType::MouseMoved) {
             // Did we cross a barrier?
             if let Some(new_pos) = state.crossed(cg_ev) {
                 capture_position = Some(new_pos);
+                state.chord_armed = false;
                 state
                     .start_capture(cg_ev, new_pos)
                     .unwrap_or_else(|e| log::warn!("{e}"));
@@ -943,5 +1014,53 @@ bitflags! {
         const Mod3Mask = (1<<5);
         const Mod4Mask = (1<<6);
         const Mod5Mask = (1<<7);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const FLAGS: CGEventType = CGEventType::FlagsChanged;
+
+    fn step(armed: &mut bool, event_type: CGEventType, flags: CGEventFlags) -> bool {
+        toggle_chord(armed, &event_type, flags)
+    }
+
+    #[test]
+    fn toggle_chord_fires_once_the_keys_are_let_go() {
+        let mut armed = false;
+        let none = CGEventFlags::CGEventFlagNull;
+        assert!(!step(&mut armed, FLAGS, CGEventFlags::CGEventFlagControl));
+        assert!(!step(&mut armed, FLAGS, toggle_chord_flags()));
+        assert!(!step(&mut armed, FLAGS, CGEventFlags::CGEventFlagCommand));
+        assert!(step(&mut armed, FLAGS, none));
+        assert!(!step(&mut armed, FLAGS, none));
+    }
+
+    #[test]
+    fn a_key_typed_with_the_toggle_chord_does_not_stop_it() {
+        let mut armed = false;
+        assert!(!step(&mut armed, FLAGS, toggle_chord_flags()));
+        assert!(!step(&mut armed, CGEventType::KeyDown, toggle_chord_flags()));
+        assert!(step(&mut armed, FLAGS, CGEventFlags::CGEventFlagNull));
+    }
+
+    #[test]
+    fn adding_shift_cancels_the_toggle_chord() {
+        let mut armed = false;
+        assert!(!step(&mut armed, FLAGS, toggle_chord_flags()));
+        assert!(!step(&mut armed, FLAGS, toggle_chord_flags() | CGEventFlags::CGEventFlagShift));
+        assert!(!step(&mut armed, FLAGS, CGEventFlags::CGEventFlagNull));
+    }
+
+    #[test]
+    fn fewer_modifiers_do_not_fire_and_caps_lock_does_not_block_it() {
+        let mut armed = false;
+        let two = toggle_chord_flags() - CGEventFlags::CGEventFlagCommand;
+        assert!(!step(&mut armed, FLAGS, two));
+        assert!(!step(&mut armed, FLAGS, CGEventFlags::CGEventFlagNull));
+        assert!(!step(&mut armed, FLAGS, toggle_chord_flags()));
+        assert!(step(&mut armed, FLAGS, CGEventFlags::CGEventFlagAlphaShift));
     }
 }

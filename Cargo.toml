@@ -10,14 +10,16 @@ anyhow = "1"
 arboard = { version = "3", features = ["wayland-data-control"] }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
+# getifaddrs, for the addresses an invite lists; CLOCK_MONOTONIC on Linux.
+libc = "0.2"
 futures = "0.3"
-# Only the backends these two machines actually use: libei on Hyprland, macOS
-# natively. X11 and the remote-desktop portal are dead weight here.
+# Only the backends these machines actually use: libei on Hyprland, X11 on
+# nullbyte's Xfce, macOS natively. The remote-desktop portal is dead weight.
 # Forked: upstream puts a capture barrier on the union of every display, so a
 # peer can only sit off the outermost screen. vendor/ adds a per-display
 # barrier. See vendor/input-capture/GLIDE-CHANGES.md.
-input-capture = { path = "vendor/input-capture", default-features = false, features = ["libei", "layer_shell"] }
-input-emulation = { version = "0.4", default-features = false, features = ["wlroots", "libei"] }
+input-capture = { path = "vendor/input-capture", default-features = false, features = ["libei", "layer_shell", "x11"] }
+input-emulation = { version = "0.4", default-features = false, features = ["wlroots", "libei", "x11"] }
 input-event = "0.4"
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
 rcgen = "0.13"
@@ -34,8 +36,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Reads and writes the clipboard by MIME type, so an image crosses as the bytes
 # it already is instead of a decoded bitmap.
 wl-clipboard-rs = "0.9"
-# CLOCK_MONOTONIC, to stamp typed events the way the compositor expects.
-libc = "0.2"
 # The receiving end of an extended display: hardware decode straight to a
 # Wayland surface, no copies through this process.
 gstreamer = "0.25"

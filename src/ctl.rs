@@ -5,6 +5,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -12,6 +13,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use tracing::{info, warn};
 
 use crate::input::Control;
+use crate::link::Links;
+use crate::pair::Me;
 
 pub fn path() -> PathBuf {
     match std::env::var_os("XDG_RUNTIME_DIR") {
@@ -20,28 +23,43 @@ pub fn path() -> PathBuf {
     }
 }
 
-/// What a line asks for. `names` is the config's peer list, in order, so a
-/// peer is addressed by name and sent on by its handle.
-pub fn parse(line: &str, names: &[String]) -> Result<Control> {
+/// What a line asks for.
+#[derive(Debug)]
+pub enum Asked {
+    Control(Control),
+    /// A fresh invite; the reply is the command to run on the new machine.
+    Invite,
+}
+
+const USAGE: &str = "pause, resume, release, peer on|off|forget <name>, extend <name>|off, invite";
+
+/// `names` is the current device list, so a typo is refused with a reason
+/// instead of silently doing nothing.
+pub fn parse(line: &str, names: &[String]) -> Result<Asked> {
     let words: Vec<&str> = line.split_whitespace().collect();
-    Ok(match words[..] {
+    let known = |name: &str| -> Result<String> {
+        names.iter().find(|n| *n == name).cloned().with_context(|| format!("no peer named {name}"))
+    };
+    Ok(Asked::Control(match words[..] {
         ["pause"] => Control::Pause(true),
         ["resume"] => Control::Pause(false),
         ["release"] => Control::Release,
-        ["peer", switch @ ("on" | "off"), name] => {
-            let handle = names.iter().position(|n| n == name).with_context(|| format!("no peer named {name}"))?;
-            Control::SetEnabled(handle as _, switch == "on")
-        }
-        _ => bail!("unknown command {line:?} (pause, resume, release, peer on|off <name>)"),
-    })
+        ["peer", switch @ ("on" | "off"), name] => Control::SetEnabled(known(name)?, switch == "on"),
+        ["peer", "forget", name] => Control::Forget(known(name)?),
+        ["extend", "off"] => Control::Extend(None),
+        ["extend", name] => Control::Extend(Some(known(name)?)),
+        ["invite"] => return Ok(Asked::Invite),
+        _ => bail!("unknown command {line:?} ({USAGE})"),
+    }))
 }
 
-/// Serve the socket for as long as the daemon runs.
-pub async fn serve(control: UnboundedSender<Control>, names: Vec<String>) -> Result<()> {
-    serve_at(&path(), control, names).await
+/// Serve the socket for as long as the daemon runs. `me` is set on a server,
+/// which is the only end that can invite.
+pub async fn serve(control: UnboundedSender<Control>, links: Arc<Links>, me: Option<Me>) -> Result<()> {
+    serve_at(&path(), control, links, me).await
 }
 
-async fn serve_at(path: &std::path::Path, control: UnboundedSender<Control>, names: Vec<String>) -> Result<()> {
+async fn serve_at(path: &std::path::Path, control: UnboundedSender<Control>, links: Arc<Links>, me: Option<Me>) -> Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -53,17 +71,23 @@ async fn serve_at(path: &std::path::Path, control: UnboundedSender<Control>, nam
     info!(path = %path.display(), "control socket ready");
     loop {
         let (stream, _) = listener.accept().await?;
-        let (control, names) = (control.clone(), names.clone());
+        let (control, links, me) = (control.clone(), links.clone(), me.clone());
         tokio::spawn(async move {
             let (read, mut write) = stream.into_split();
             let mut line = String::new();
             if tokio::io::BufReader::new(read).read_line(&mut line).await.is_err() {
                 return;
             }
+            let names: Vec<String> = links.peers().into_iter().map(|p| p.name).collect();
             let reply = match parse(line.trim(), &names) {
-                Ok(asked) => match control.send(asked) {
+                Ok(Asked::Control(asked)) => match control.send(asked) {
                     Ok(()) => "ok".to_string(),
                     Err(_) => "error: the daemon is stopping".to_string(),
+                },
+                Ok(Asked::Invite) => match me.as_ref().map(crate::pair::invite) {
+                    Some(Ok(command)) => command,
+                    Some(Err(e)) => format!("error: {e}"),
+                    None => "error: only a server can invite".to_string(),
                 },
                 Err(e) => {
                     warn!("control socket: {e}");
@@ -100,13 +124,24 @@ mod tests {
         vec!["anorak".into(), "anton".into()]
     }
 
+    fn control(line: &str) -> Control {
+        match parse(line, &names()).unwrap() {
+            Asked::Control(c) => c,
+            Asked::Invite => panic!("{line} is not an invite"),
+        }
+    }
+
     #[test]
     fn every_command_maps_to_its_control() {
-        assert!(matches!(parse("pause", &names()).unwrap(), Control::Pause(true)));
-        assert!(matches!(parse("resume", &names()).unwrap(), Control::Pause(false)));
-        assert!(matches!(parse("release", &names()).unwrap(), Control::Release));
-        assert!(matches!(parse("peer off anton", &names()).unwrap(), Control::SetEnabled(1, false)));
-        assert!(matches!(parse("  peer on anorak \n", &names()).unwrap(), Control::SetEnabled(0, true)));
+        assert!(matches!(control("pause"), Control::Pause(true)));
+        assert!(matches!(control("resume"), Control::Pause(false)));
+        assert!(matches!(control("release"), Control::Release));
+        assert!(matches!(control("peer off anton"), Control::SetEnabled(n, false) if n == "anton"));
+        assert!(matches!(control("  peer on anorak \n"), Control::SetEnabled(n, true) if n == "anorak"));
+        assert!(matches!(control("peer forget anton"), Control::Forget(n) if n == "anton"));
+        assert!(matches!(control("extend anorak"), Control::Extend(Some(n)) if n == "anorak"));
+        assert!(matches!(control("extend off"), Control::Extend(None)));
+        assert!(matches!(parse("invite", &names()).unwrap(), Asked::Invite));
     }
 
     #[test]
@@ -115,6 +150,7 @@ mod tests {
         assert!(parse("reboot", &names()).unwrap_err().to_string().contains("unknown command"));
         assert!(parse("", &names()).is_err());
         assert!(parse("peer maybe anton", &names()).is_err());
+        assert!(parse("extend nobody", &names()).is_err());
     }
 
     #[test]
@@ -133,7 +169,14 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let server = tokio::spawn({
             let path = path.clone();
-            async move { serve_at(&path, tx, names()).await }
+            let links = Arc::new(Links::new(
+                names()
+                    .into_iter()
+                    .map(|name| crate::Peer { name, addrs: vec![], fingerprint: String::new(), position: crate::Side::Left, display: None, enabled: true })
+                    .collect(),
+                true,
+            ));
+            async move { serve_at(&path, tx, links, None).await }
         });
         while !path.exists() {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -143,10 +186,12 @@ mod tests {
         let words = |w: &str| w.split(' ').map(String::from).collect::<Vec<_>>();
         let reply = { let path = path.clone(); tokio::task::spawn_blocking(move || send_to(&path, &words("peer off anton"))).await.unwrap() };
         assert_eq!(reply.unwrap(), "ok");
-        assert!(matches!(rx.recv().await, Some(Control::SetEnabled(1, false))));
+        assert!(matches!(rx.recv().await, Some(Control::SetEnabled(n, false)) if n == "anton"));
         let refused = { let path = path.clone(); tokio::task::spawn_blocking(move || send_to(&path, &words("peer off nobody"))).await.unwrap() };
         assert!(refused.unwrap_err().to_string().contains("no peer named nobody"));
         assert!(rx.try_recv().is_err(), "a refused command sends nothing");
+        let invite = { let path = path.clone(); tokio::task::spawn_blocking(move || send_to(&path, &words("invite"))).await.unwrap() };
+        assert!(invite.unwrap_err().to_string().contains("only a server"), "no identity, no invite");
         server.abort();
         let _ = std::fs::remove_dir_all(&dir);
     }

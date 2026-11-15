@@ -9,6 +9,11 @@
 #   exec-once = systemctl --user import-environment WAYLAND_DISPLAY XDG_RUNTIME_DIR HYPRLAND_INSTANCE_SIGNATURE
 #   exec-once = systemctl --user start glide.service
 #
+# On Xfce (X11, nullbyte) the same job falls to an autostart entry,
+# ~/.config/autostart/glide.desktop, whose Exec is:
+#
+#   sh -c "systemctl --user import-environment DISPLAY XAUTHORITY && systemctl --user restart glide.service"
+#
 # There is no [Install] section on purpose: graphical-session.target is never
 # reached under plain Hyprland, so an enabled unit would sit waiting forever.
 

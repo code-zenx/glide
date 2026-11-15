@@ -12,6 +12,7 @@
 //! else to say.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures::StreamExt;
@@ -22,14 +23,15 @@ use input_event::{Event, KeyboardEvent};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tracing::{debug, info, warn};
 
-use crate::display::{self, Mode as DisplayMode};
+use crate::display;
 use crate::link::Links;
 use crate::proto::Msg;
 use crate::status::Status;
 use crate::{Config, Peer, Role, Side};
 
-/// Held together, these hand input back to this machine even if the peer never
-/// answers again — the way out of a wedged remote session.
+/// Held together, these hand input back to this machine at once, even if the
+/// peer never answers again — the way out of a wedged remote session. The
+/// everyday toggle is Ctrl+Option+Cmd, watched in the capture backend.
 const RELEASE_CHORD: [Key; 4] = [
     Key::KeyLeftCtrl,
     Key::KeyLeftShift,
@@ -39,7 +41,10 @@ const RELEASE_CHORD: [Key; 4] = [
 
 /// The chord spelled out, logged the moment the cursor leaves — the one time
 /// someone might need it is the one time they cannot look it up.
-const RELEASE_HINT: &str = "Ctrl+Shift+Alt+Cmd together";
+const RELEASE_HINT: &str = "Ctrl+Option+Cmd";
+
+/// Far longer than input takes to arrive from a peer on the same network.
+const HAND_BACK_SETTLE: Duration = Duration::from_millis(200);
 
 impl From<Side> for Position {
     fn from(side: Side) -> Self {
@@ -102,11 +107,14 @@ struct Handover {
     /// server: its keyboard and mouse are the ones being shared, and nothing
     /// arriving over the link may type here.
     driven: bool,
+    /// After this machine hands control back, input still in flight from the
+    /// peer must not read as the peer taking it again.
+    settling_until: Option<Instant>,
 }
 
 impl Handover {
     fn new(driven: bool) -> Self {
-        Self { mode: Mode::Local, driven }
+        Self { mode: Mode::Local, driven, settling_until: None }
     }
 
     fn name(&self) -> &'static str {
@@ -157,6 +165,7 @@ impl Handover {
         }
         let was_sending = matches!(self.mode, Mode::Sending(_));
         self.mode = Mode::Receiving(handle);
+        self.settling_until = None;
         was_sending
     }
 
@@ -188,6 +197,7 @@ impl Handover {
         }
         match self.mode {
             Mode::Receiving(h) => h == handle,
+            Mode::Local if self.settling_until.is_some_and(|until| Instant::now() < until) => false,
             Mode::Local => {
                 self.mode = Mode::Receiving(handle);
                 true
@@ -200,6 +210,12 @@ impl Handover {
     fn take_back(&mut self) {
         self.mode = Mode::Local;
     }
+
+    /// This client's edge gave the cursor back to the server.
+    fn handed_back(&mut self) {
+        self.mode = Mode::Local;
+        self.settling_until = Some(Instant::now() + HAND_BACK_SETTLE);
+    }
 }
 
 /// Asked for from outside the daemon — today, from the macOS menu bar, which
@@ -207,14 +223,18 @@ impl Handover {
 #[derive(Debug)]
 pub enum Control {
     /// Move a peer's screen to another edge, optionally of one display only.
-    SetPosition(CaptureHandle, Side, Option<usize>),
+    SetPosition(String, Side, Option<usize>),
     /// Try the input backends again, after permission was granted.
     RetryBackends,
-    /// Switch between driving the peer and extending this screen onto it.
-    SetMode(DisplayMode),
-    /// Switch one peer off (or back on). Paused: its edge is disarmed, no
-    /// clipboard crosses, and it is told so; the link itself stays up.
-    SetEnabled(CaptureHandle, bool),
+    /// Show the extended display on this device, or on none.
+    Extend(Option<String>),
+    /// Switch one peer off (or back on). Off: the link is closed and the
+    /// peer told why; nothing crosses until it is switched on again.
+    SetEnabled(String, bool),
+    /// A device was just paired (or re-paired under its old name).
+    AddPeer(Peer),
+    /// Forget a device: off for good, and out of the config.
+    Forget(String),
     /// From this machine's own bar: a client stops being driven (and tells the
     /// server); undone with `false`.
     Pause(bool),
@@ -223,11 +243,17 @@ pub enum Control {
 }
 
 /// Whether a peer's screen edge should be armed: only with a live link behind
-/// it, never while the peer is showing our extended display — the cursor
+/// it, never while that peer is showing our extended display — the cursor
 /// then belongs on the virtual screen, not in the peer — and never while the
-/// peer is switched off.
-fn edge_wanted(linked: bool, extending: bool, enabled: bool) -> bool {
-    linked && !extending && enabled
+/// peer is switched off. Other peers stay reachable while one extends.
+fn edge_wanted(linked: bool, extended_here: bool, enabled: bool) -> bool {
+    linked && !extended_here && enabled
+}
+
+/// Whether this machine can show a server's extended display: the receiving
+/// end drives Hyprland, so an X11 desktop cannot.
+fn can_extend_here() -> bool {
+    cfg!(not(target_os = "macos")) && std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
 }
 
 /// Switching a peer off while it holds the cursor must bring the cursor home
@@ -246,6 +272,11 @@ async fn hand_back(capture: &mut Option<InputCapture>, links: &Links, peer: &str
     links.send(peer, Msg::Leave);
     handover.take_back();
     release(capture.as_mut()).await
+}
+
+/// The handle of a device that has not been forgotten.
+fn live(names: &[String], gone: &[bool], name: &str) -> Option<usize> {
+    names.iter().enumerate().position(|(i, n)| n == name && !gone[i])
 }
 
 async fn set_edge(capture: &mut InputCapture, handle: usize, peer: &Peer, on: bool) -> Result<()> {
@@ -270,7 +301,11 @@ pub async fn session(
     mut control: UnboundedReceiver<Control>,
     display: tokio::sync::mpsc::UnboundedSender<display::Event>,
 ) -> Result<()> {
-    let names: Vec<String> = config.peers.iter().map(|p| p.name.clone()).collect();
+    // Handles are indices into these lists, so a forgotten device keeps its
+    // slot (marked gone) until the next start: every other device's handle,
+    // and the edge the capture backend keyed to it, stays put.
+    let mut names: Vec<String> = config.peers.iter().map(|p| p.name.clone()).collect();
+    let mut gone = vec![false; names.len()];
     let server = config.role == Role::Server;
 
     // Both ends watch an edge — the server to take the cursor, the client to
@@ -288,12 +323,12 @@ pub async fn session(
     let mut enabled: Vec<bool> = config.peers.iter().map(|p| !server || p.enabled).collect();
     // A client that paused itself: like switched off, but its choice, not saved here.
     let mut held_off = vec![false; config.peers.len()];
-    for (i, on) in enabled.iter().enumerate() {
-        links.set_paused(&names[i], !on);
-        status.set_peer(&names[i], |p| p.paused = !on);
-    }
     // Only a server has a display to extend.
-    let mut extending = server && config.display.mode == DisplayMode::Extend;
+    let mut extend: Option<usize> = if server {
+        crate::extend_target(&config).and_then(|t| names.iter().position(|n| *n == t.name))
+    } else {
+        None
+    };
     for i in 0..config.peers.len() {
         if let Some(emulation) = emulation.as_mut() {
             emulation.create(i as CaptureHandle).await;
@@ -306,7 +341,7 @@ pub async fn session(
     // whole state to compare it, and at a thousand events a second that is all
     // wasted work on the path that has to stay quick.
     let mut shown = ("", None, !degraded);
-    let publish = |handover: &Handover, degraded: bool, shown: &mut (&'static str, Option<CaptureHandle>, bool)| {
+    let publish = |names: &[String], handover: &Handover, degraded: bool, shown: &mut (&'static str, Option<CaptureHandle>, bool)| {
         let now = (handover.name(), handover.peer(), !degraded);
         if *shown != now {
             *shown = now;
@@ -334,6 +369,10 @@ pub async fn session(
                             Crossing::HandBack => {
                                 info!(%peer, "cursor reached this edge, handing control back");
                                 links.send(peer, Msg::Leave);
+                                if let Some(emulation) = emulation.as_mut() {
+                                    let _ = emulation.release_keys(handle).await;
+                                }
+                                handover.handed_back();
                                 release(capture.as_mut()).await?;
                             }
                             Crossing::Stay => {
@@ -352,6 +391,12 @@ pub async fn session(
                                 links.send(peer, Msg::Input(event));
                             }
                         }
+                        CaptureEvent::Toggle => {
+                            if server && handover.forwarding(handle) {
+                                info!(%peer, "toggle chord pressed, taking input back");
+                                hand_back(&mut capture, &links, peer, &mut handover).await?;
+                            }
+                        }
                     }
                     let chord =
                         server && capture.as_ref().is_some_and(|c| c.keys_pressed(&RELEASE_CHORD));
@@ -359,7 +404,7 @@ pub async fn session(
                         info!("release chord pressed, taking input back");
                         hand_back(&mut capture, &links, peer, &mut handover).await?;
                     }
-                    publish(&handover, degraded, &mut shown);
+                    publish(&names, &handover, degraded, &mut shown);
                 }
                 // The event tap dies for reasons outside this process: a
                 // password field turning on secure input, a revoked grant. Put
@@ -368,7 +413,7 @@ pub async fn session(
                 Some(Err(e)) => {
                     warn!("capture error, input is local again: {e}");
                     handover.take_back();
-                    publish(&handover, degraded, &mut shown);
+                    publish(&names, &handover, degraded, &mut shown);
                 }
                 None => {
                     warn!("capture ended");
@@ -378,16 +423,21 @@ pub async fn session(
             change = link_state.recv() => {
                 let Some((peer, up)) = change else { break };
                 let _ = display.send(display::Event::Link(peer.clone(), up));
-                let Some(handle) = names.iter().position(|n| *n == peer) else { continue };
+                let Some(handle) = live(&names, &gone, &peer) else { continue };
                 linked[handle] = up;
-                if up && !enabled[handle] {
-                    links.send(&peer, Msg::Paused(true));
+                if up && !server {
+                    links.send(&peer, Msg::Caps { extend: can_extend_here() });
                 }
-                let Some(capture) = capture.as_mut() else { continue };
+                // A client that was offline when it was moved in the Arrange
+                // window still has the old side; say it again on every link.
+                if up && server {
+                    links.send(&peer, Msg::Arrange(config.peers[handle].position.opposite()));
+                }
                 if !up {
                     held_off[handle] = false;
                 }
-                let want = edge_wanted(up, extending, enabled[handle] && !held_off[handle]);
+                let Some(capture) = capture.as_mut() else { continue };
+                let want = edge_wanted(up, extend == Some(handle), enabled[handle] && !held_off[handle]);
                 if want == armed[handle] {
                     continue;
                 }
@@ -403,30 +453,85 @@ pub async fn session(
             },
             asked = control.recv() => {
                 let Some(asked) = asked else { break };
-                if let Control::SetMode(mode) = asked {
-                    extending = server && mode == DisplayMode::Extend;
-                    info!(?mode, "display mode");
-                    if let Err(e) = crate::set_display_mode(&config_path, mode) {
-                        warn!("cannot save the display mode: {e}");
+                if let Control::Extend(target) = asked {
+                    let target = target.and_then(|name| live(&names, &gone, &name));
+                    if !server || target == extend {
+                        continue;
                     }
-                    let _ = display.send(display::Event::Mode(mode));
-                    // Extending while the cursor is in the peer: bring it home
-                    // first, or it stays there with its edge gone.
-                    if let Some(handle) = handover.sending().filter(|_| extending) {
+                    extend = target;
+                    let name = target.map(|i| names[i].clone());
+                    info!(device = ?name, "extended display");
+                    if let Err(e) = crate::set_extend(&config_path, name.as_deref()) {
+                        warn!("cannot save the extended display: {e}");
+                    }
+                    status.set(|s| s.extending = name.clone().unwrap_or_default());
+                    let _ = display.send(display::Event::Target(target.map(|i| config.peers[i].clone())));
+                    // Extending to the device that has the cursor: bring it
+                    // home first, or it stays there with its edge gone.
+                    if let Some(handle) = handover.sending().filter(|h| Some(*h as usize) == extend) {
                         links.send(&names[handle as usize], Msg::Leave);
                         handover.take_back();
                         release(capture.as_mut()).await?;
                     }
                     if let Some(capture) = capture.as_mut() {
                         for (i, peer) in config.peers.iter().enumerate() {
-                            let want = edge_wanted(linked[i], extending, enabled[i] && !held_off[i]);
+                            let want = !gone[i] && edge_wanted(linked[i], extend == Some(i), enabled[i] && !held_off[i]);
                             if want != armed[i] {
                                 armed[i] = want;
                                 set_edge(capture, i, peer, want).await?;
                             }
                         }
                     }
-                    publish(&handover, degraded, &mut shown);
+                    publish(&names, &handover, degraded, &mut shown);
+                    continue;
+                }
+                if let Control::AddPeer(peer) = asked {
+                    match live(&names, &gone, &peer.name) {
+                        // Re-paired: new certificate and address, same place.
+                        // Links already closed the link under the old key.
+                        Some(i) => config.peers[i] = peer,
+                        None => {
+                            let i = names.len();
+                            names.push(peer.name.clone());
+                            gone.push(false);
+                            armed.push(false);
+                            linked.push(false);
+                            enabled.push(true);
+                            held_off.push(false);
+                            if let Some(emulation) = emulation.as_mut() {
+                                emulation.create(i as CaptureHandle).await;
+                            }
+                            info!(peer = %peer.name, side = ?peer.position, display = ?peer.display, "device added");
+                            config.peers.push(peer);
+                        }
+                    }
+                    continue;
+                }
+                if let Control::Forget(name) = asked {
+                    let Some(i) = live(&names, &gone, &name) else { continue };
+                    if handover.sending() == Some(i as CaptureHandle) {
+                        hand_back(&mut capture, &links, &name, &mut handover).await?;
+                    }
+                    if armed[i] {
+                        armed[i] = false;
+                        if let Some(capture) = capture.as_mut() {
+                            capture.destroy(i as CaptureHandle).await?;
+                        }
+                    }
+                    if extend == Some(i) {
+                        extend = None;
+                        status.set(|s| s.extending.clear());
+                        let _ = display.send(display::Event::Target(None));
+                    }
+                    gone[i] = true;
+                    enabled[i] = false;
+                    links.forget(&name);
+                    status.remove_peer(&name);
+                    if let Err(e) = crate::forget_peer(&config_path, &name) {
+                        warn!(peer = %name, "cannot remove it from the config: {e}");
+                    }
+                    info!(peer = %name, "device forgotten");
+                    publish(&names, &handover, degraded, &mut shown);
                     continue;
                 }
                 if let Control::Release = asked {
@@ -441,7 +546,7 @@ pub async fn session(
                         }
                         handover.take_back();
                     }
-                    publish(&handover, degraded, &mut shown);
+                    publish(&names, &handover, degraded, &mut shown);
                     continue;
                 }
                 if let Control::Pause(paused) = asked {
@@ -449,7 +554,7 @@ pub async fn session(
                     // switch is per client (SetEnabled).
                     if !server {
                         handover.driven = !paused;
-                        for (i, name) in names.iter().enumerate() {
+                        for (i, name) in names.iter().enumerate().filter(|(i, _)| !gone[*i]) {
                             links.send(name, Msg::Paused(paused));
                             status.set_peer(name, |p| p.paused = paused);
                             if paused && handover.receiving() == Some(i as CaptureHandle) {
@@ -460,42 +565,49 @@ pub async fn session(
                             }
                         }
                         info!(paused, "this machine paused itself");
-                        publish(&handover, degraded, &mut shown);
+                        publish(&names, &handover, degraded, &mut shown);
                     }
                     continue;
                 }
-                if let Control::SetEnabled(handle, on) = asked {
-                    let i = handle as usize;
-                    let Some(peer) = names.get(i).cloned() else { continue };
+                if let Control::SetEnabled(peer, on) = asked {
+                    let Some(i) = live(&names, &gone, &peer).filter(|_| server) else { continue };
+                    let handle = i as CaptureHandle;
                     if pause_takes_back(handover.sending(), handle, on) {
                         info!(%peer, "switched off while it had the cursor, taking input back");
                         hand_back(&mut capture, &links, &peer, &mut handover).await?;
                     }
                     enabled[i] = on;
                     config.peers[i].enabled = on;
-                    links.set_paused(&peer, !on);
-                    status.set_peer(&peer, |p| p.paused = !on);
-                    links.send(&peer, Msg::Paused(!on));
+                    links.set_off(&peer, !on);
+                    if on {
+                        // The dialer picks it up within a couple of seconds.
+                        status.set_peer(&peer, |p| p.mode = "offline".into());
+                    } else {
+                        // Closing the link drops its edge and pauses an
+                        // extended display, which resumes when it is back.
+                        links.disconnect(&peer, crate::link::OFF);
+                        status.set_peer(&peer, |p| p.mode = "off".into());
+                    }
                     if let Err(e) = crate::set_enabled(&config_path, &peer, on) {
                         warn!(%peer, "cannot save the switch: {e}");
                     }
-                    let want = edge_wanted(linked[i], extending, on && !held_off[i]);
+                    let want = edge_wanted(linked[i], extend == Some(i), on && !held_off[i]);
                     if let Some(capture) = capture.as_mut().filter(|_| want != armed[i]) {
                         armed[i] = want;
                         set_edge(capture, i, &config.peers[i], want).await?;
                     }
                     info!(%peer, on, "peer switched");
-                    publish(&handover, degraded, &mut shown);
+                    publish(&names, &handover, degraded, &mut shown);
                     continue;
                 }
-                let Control::SetPosition(handle, side, on_display) = asked else {
+                let Control::SetPosition(name, side, on_display) = asked else {
                     // RetryBackends: permission may have just been granted, so
                     // build whichever backend this machine's role needs.
                     if capture.is_none() {
                         capture = open_capture().await;
                         if let Some(capture) = capture.as_mut() {
                             for (i, peer) in config.peers.iter().enumerate() {
-                                if !armed[i] {
+                                if !armed[i] || gone[i] {
                                     continue;
                                 }
                                 set_edge(capture, i, peer, true).await?;
@@ -513,10 +625,11 @@ pub async fn session(
                         }
                     }
                     degraded = capture.is_none() || (!server && emulation.is_none());
-                    publish(&handover, degraded, &mut shown);
+                    publish(&names, &handover, degraded, &mut shown);
                     continue;
                 };
-                let Some(peer) = names.get(handle as usize) else { continue };
+                let Some(i) = live(&names, &gone, &name) else { continue };
+                let (handle, peer) = (i as CaptureHandle, &names[i]);
                 // Kept current, so re-arming later puts the edge where it is
                 // now rather than where it was at startup.
                 config.peers[handle as usize].position = side;
@@ -535,7 +648,7 @@ pub async fn session(
             },
             incoming = from_links.recv() => {
                 let Some((peer, msg)) = incoming else { break };
-                let Some(handle) = names.iter().position(|n| *n == peer).map(|i| i as CaptureHandle) else { continue };
+                let Some(handle) = live(&names, &gone, &peer).map(|i| i as CaptureHandle) else { continue };
                 match msg {
                     Msg::Enter => {
                         if handover.peer_entered(handle) {
@@ -580,6 +693,8 @@ pub async fn session(
                         info!(%peer, "clipboard arrived");
                         tokio::spawn(crate::clipboard::write(clip));
                     }
+                    // Sent on every link, so most of the time nothing moved.
+                    Msg::Arrange(side) if config.peers[handle as usize].position == side => {}
                     Msg::Arrange(side) => {
                         info!(%peer, ?side, "peer says it sits on our {side:?}");
                         if let Err(e) = crate::set_peer_side(&config_path, &peer, side) {
@@ -607,8 +722,8 @@ pub async fn session(
                                 hand_back(&mut capture, &links, &peer, &mut handover).await?;
                             }
                             held_off[i] = paused;
-                            status.set_peer(&peer, |p| p.paused = paused || !enabled[i]);
-                            let want = edge_wanted(linked[i], extending, enabled[i] && !paused);
+                            status.set_peer(&peer, |p| p.paused = paused);
+                            let want = edge_wanted(linked[i], extend == Some(i), enabled[i] && !paused);
                             if let Some(capture) = capture.as_mut().filter(|_| want != armed[i]) {
                                 armed[i] = want;
                                 set_edge(capture, i, &config.peers[i], want).await?;
@@ -618,14 +733,18 @@ pub async fn session(
                             status.set_peer(&peer, |p| p.paused = paused);
                             info!(%peer, paused, "server switched this machine");
                         }
-                        publish(&handover, degraded, &mut shown);
+                        publish(&names, &handover, degraded, &mut shown);
+                    }
+                    Msg::Caps { extend: can } => {
+                        info!(%peer, can_extend = can, "peer described what it can do");
+                        status.set_peer(&peer, |p| p.can_extend = can);
                     }
                     Msg::Display(_) | Msg::DisplayReady(_) => {
                         let _ = display.send(display::Event::Msg(peer, msg));
                     }
                     Msg::Ping(_) | Msg::Pong(_) => {}
                 }
-                publish(&handover, degraded, &mut shown);
+                publish(&names, &handover, degraded, &mut shown);
             }
         }
     }
@@ -718,6 +837,19 @@ fn stamp_now(mut event: Event) -> Event {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn input_in_flight_after_a_hand_back_does_not_take_the_cursor_again() {
+        let mut handover = Handover::new(true);
+        handover.peer_entered(0);
+        handover.handed_back();
+        assert_eq!(handover.name(), "local");
+        assert!(!handover.peer_input(0));
+        assert_eq!(handover.name(), "local");
+        assert!(!handover.peer_entered(0));
+        assert!(handover.peer_input(0));
+        assert_eq!(handover.name(), "receiving");
+    }
+
     use super::*;
 
     /// A client: driven by the server, shares nothing of its own.
@@ -812,6 +944,18 @@ mod tests {
         assert!(!edge_wanted(false, false, true), "no link: no edge");
         assert!(!edge_wanted(false, true, true));
         assert!(!edge_wanted(true, false, false), "switched off: no edge");
+    }
+
+    /// Forgetting a device must not shift anyone else's handle: the capture
+    /// backend keyed each edge to one.
+    #[test]
+    fn a_forgotten_device_keeps_its_slot() {
+        let names: Vec<String> = ["anorak", "nullbyte", "anton"].map(String::from).to_vec();
+        let gone = [false, true, false];
+        assert_eq!(live(&names, &gone, "anton"), Some(2), "anton's handle is unchanged");
+        assert_eq!(live(&names, &gone, "nullbyte"), None, "the forgotten one is gone");
+        let names: Vec<String> = ["anorak", "nullbyte", "anton", "nullbyte"].map(String::from).to_vec();
+        assert_eq!(live(&names, &[false, true, false, false], "nullbyte"), Some(3), "re-paired after forgetting: the new slot");
     }
 
     #[test]

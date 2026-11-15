@@ -41,6 +41,8 @@ pub enum CaptureEvent {
     Begin,
     /// input event coming from capture handle
     Input(Event),
+    /// glide: the toggle chord was pressed while capturing, give input back
+    Toggle,
 }
 
 impl Display for CaptureEvent {
@@ -48,6 +50,7 @@ impl Display for CaptureEvent {
         match self {
             CaptureEvent::Begin => write!(f, "begin capture"),
             CaptureEvent::Input(e) => write!(f, "{e}"),
+            CaptureEvent::Toggle => write!(f, "toggle chord"),
         }
     }
 }

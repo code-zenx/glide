@@ -1,6 +1,6 @@
 # What glide changed in this crate
 
-Vendored from `input-capture` 0.4.0 (GPL-3.0, from lan-mouse). Two changes:
+Vendored from `input-capture` 0.4.0 (GPL-3.0, from lan-mouse). Three changes:
 
 ## A capture barrier can belong to a single display
 
@@ -50,3 +50,23 @@ Changed, macOS only:
   thread and leave the cursor hidden.
 - The display-reconfiguration callback, which runs on the same run loop, uses
   `try_send` for the same reason.
+
+## Input can move without the cursor reaching an edge
+
+The barrier was the only way to start capturing. On macOS, pressing and letting
+go of Ctrl+Option+Cmd now starts capture through the first armed barrier and
+leaves the cursor where it is (`toggle_chord` in `macos.rs`). The same chord while
+capturing sends a new `CaptureEvent::Toggle`, and the session gives input back.
+It fires on key up, so whichever machine has the keyboard sees each modifier
+released, and Shift pressed with the chord cancels it. Nothing armed, nothing
+happens. `ProducerEvent::Release` also clears `modifier_state`,
+which went stale when keys were let go after a release.
+
+## X11 watches an edge instead of capturing
+
+Upstream's X11 backend was a stub that refused to start. A glide client only
+needs to know when the cursor the server drives reaches the edge leading back,
+so `x11.rs` polls `XQueryPointer` at 100 Hz and reports `Begin` once per arrival
+at an armed edge of the root window. `release()` steps the cursor 2 px back off
+that edge so the next push counts again. It grabs nothing, so it is no use on
+an X11 server. Added for `nullbyte` (Kali, Xfce).

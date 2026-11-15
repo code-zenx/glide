@@ -11,6 +11,7 @@ mod link;
 mod arrange;
 #[cfg(target_os = "macos")]
 mod menubar;
+mod pair;
 mod proto;
 mod screens;
 mod status;
@@ -66,7 +67,7 @@ enum Cmd {
         /// One JSON object per line, the shape waybar expects
         #[arg(long)]
         json: bool,
-        /// Keep printing, once a second
+        /// Keep printing, within a tenth of a second of each change
         #[arg(long)]
         watch: bool,
         /// Print the app's letter instead of words, for a bar that draws it as
@@ -74,7 +75,18 @@ enum Cmd {
         #[arg(long)]
         icon: bool,
     },
-    /// Steer the running daemon: pause, resume, release, peer on|off <name>
+    /// Make a one-time invite (server): prints the `glide join …` command to
+    /// run on the new machine. Valid for ten minutes.
+    Invite,
+    /// Pair this machine with a server, using the command its invite printed
+    Join {
+        token: String,
+        /// This machine's name on the server (default: the hostname)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Steer the running daemon: pause, resume, release, peer on|off|forget
+    /// <name>, extend <name>|off, invite
     Ctl {
         #[arg(required = true, trailing_var_arg = true)]
         words: Vec<String>,
@@ -121,7 +133,7 @@ pub enum Role {
     Client,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Peer {
     pub name: String,
     /// Every address this peer may be reachable on: wired first, then wireless
@@ -135,8 +147,8 @@ pub struct Peer {
     /// whole desktop, which is upstream lan-mouse's behaviour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<usize>,
-    /// Switched off from the server's menu: the link stays up so both ends can
-    /// say so, but the edge is disarmed and no clipboard crosses.
+    /// Switched off from the server's menu: the server neither dials it nor
+    /// accepts it, and tells it so, so nothing at all crosses.
     #[serde(default = "yes", skip_serializing_if = "is_yes")]
     pub enabled: bool,
 }
@@ -171,7 +183,7 @@ impl Side {
     }
 }
 
-fn default_listen() -> SocketAddr {
+pub(crate) fn default_listen() -> SocketAddr {
     "0.0.0.0:4242".parse().unwrap()
 }
 
@@ -205,10 +217,113 @@ pub fn arrange_peers(path: &Path) -> Result<Vec<(String, Side, Option<usize>)>> 
     Ok(load(path)?.peers.into_iter().map(|p| (p.name, p.position, p.display)).collect())
 }
 
-/// Every peer with its switch, for the menu bar's Clients section.
-#[cfg(target_os = "macos")]
-fn config_clients(path: &Path) -> Result<Vec<(String, bool)>> {
-    Ok(load(path)?.peers.into_iter().map(|p| (p.name, p.enabled)).collect())
+/// The device the extended display goes to, if any. An old config's
+/// `mode = "extend"` meant the first peer.
+pub fn extend_target(config: &Config) -> Option<Peer> {
+    match (&config.display.extend, config.display.mode) {
+        (Some(name), _) => config.peers.iter().find(|p| &p.name == name).cloned(),
+        (None, display::Mode::Extend) => config.peers.first().cloned(),
+        (None, display::Mode::Control) => None,
+    }
+}
+
+/// Remember which device shows the extended display, so it comes back after a
+/// restart.
+pub fn set_extend(path: &Path, target: Option<&str>) -> Result<()> {
+    let mut config = load(path)?;
+    config.display.extend = target.map(str::to_string);
+    config.display.mode = if target.is_some() { display::Mode::Extend } else { display::Mode::Control };
+    std::fs::write(path, toml::to_string_pretty(&config)?)?;
+    Ok(())
+}
+
+/// A paired device: added on the first free edge, or, when one by that name
+/// exists already (a reinstalled machine), given its new certificate and
+/// address and left where it was.
+pub fn add_peer(path: &Path, name: &str, fingerprint: &str, addr: SocketAddr, screens: &[screens::Screen]) -> Result<Peer> {
+    let mut config = load(path)?;
+    let peer = match config.peers.iter_mut().find(|p| p.name == name) {
+        Some(peer) => {
+            peer.fingerprint = fingerprint.to_string();
+            peer.addrs.retain(|a| *a != addr);
+            peer.addrs.insert(0, addr);
+            peer.clone()
+        }
+        None => {
+            let (position, display) = free_edge(&config.peers, screens);
+            let peer = Peer {
+                name: name.to_string(),
+                addrs: vec![addr],
+                fingerprint: fingerprint.to_string(),
+                position,
+                display,
+                enabled: true,
+            };
+            config.peers.push(peer.clone());
+            peer
+        }
+    };
+    std::fs::write(path, toml::to_string_pretty(&config)?)?;
+    Ok(peer)
+}
+
+/// The first outer edge of a display that no device sits on: displays in
+/// order, and on each left, right, bottom, top. An edge another display of
+/// this machine touches is not outer — the cursor goes to that display there.
+fn free_edge(peers: &[Peer], screens: &[screens::Screen]) -> (Side, Option<usize>) {
+    let taken = |side: Side, display: usize| peers.iter().any(|p| p.position == side && p.display.unwrap_or(1) == display);
+    for display in 1..=screens.len().max(1) {
+        for side in [Side::Left, Side::Right, Side::Bottom, Side::Top] {
+            if outer(screens, display - 1, side) && !taken(side, display) {
+                return (side, Some(display));
+            }
+        }
+    }
+    // ponytail: every outer edge is taken, so two devices share one; the
+    // Arrange window moves either.
+    (Side::Top, Some(1))
+}
+
+fn outer(screens: &[screens::Screen], i: usize, side: Side) -> bool {
+    let Some(s) = screens.get(i) else { return true };
+    let (sx, sy, sw, sh) = (s.x, s.y, s.w as i32, s.h as i32);
+    !screens.iter().enumerate().any(|(j, o)| {
+        let (ox, oy, ow, oh) = (o.x, o.y, o.w as i32, o.h as i32);
+        let along_y = oy < sy + sh && sy < oy + oh;
+        let along_x = ox < sx + sw && sx < ox + ow;
+        j != i
+            && match side {
+                Side::Left => ox + ow == sx && along_y,
+                Side::Right => sx + sw == ox && along_y,
+                Side::Top => oy + oh == sy && along_x,
+                Side::Bottom => sy + sh == oy && along_x,
+            }
+    })
+}
+
+/// Drop a device from the config: its certificate is no longer trusted.
+pub fn forget_peer(path: &Path, peer_name: &str) -> Result<()> {
+    let mut config = load(path)?;
+    config.peers.retain(|p| p.name != peer_name);
+    if config.display.extend.as_deref() == Some(peer_name) {
+        config.display.extend = None;
+        config.display.mode = display::Mode::Control;
+    }
+    std::fs::write(path, toml::to_string_pretty(&config)?)?;
+    Ok(())
+}
+
+/// Remember the addresses a peer was last reached on.
+pub fn set_peer_addrs(path: &Path, peer_name: &str, addrs: Vec<SocketAddr>) -> Result<()> {
+    let mut config = load(path)?;
+    let peer = config
+        .peers
+        .iter_mut()
+        .find(|p| p.name == peer_name)
+        .with_context(|| format!("no peer named {peer_name}"))?;
+    peer.addrs = addrs;
+    std::fs::write(path, toml::to_string_pretty(&config)?)?;
+    Ok(())
 }
 
 /// Remember whether a peer is switched on, so a pause survives a restart.
@@ -237,13 +352,6 @@ pub fn set_peer_side(path: &Path, peer_name: &str, side: Side) -> Result<()> {
     Ok(())
 }
 
-/// Remember the display mode, so the app comes back in it after a restart.
-pub fn set_display_mode(path: &Path, mode: display::Mode) -> Result<()> {
-    let mut config = load(path)?;
-    config.display.mode = mode;
-    std::fs::write(path, toml::to_string_pretty(&config)?)?;
-    Ok(())
-}
 
 /// Everything except the user interface: the link, the input session and the
 /// clipboard watcher, run until something gives out.
@@ -259,19 +367,21 @@ fn daemon(
     // The Wayland capture backend spawns non-Send tasks, so the session has to
     // run inside a LocalSet.
     tokio::task::LocalSet::new().block_on(&runtime, async move {
-        let links = Arc::new(link::Links::default());
+        let server = config.role == Role::Server;
+        let links = Arc::new(link::Links::new(config.peers.clone(), server));
         let (to_session, from_links) = tokio::sync::mpsc::unbounded_channel();
         // Whether each peer is reachable, so the session only arms a screen
         // edge when there is a live link behind it.
         let (link_up, link_state) = tokio::sync::mpsc::unbounded_channel();
-        let peers: Vec<String> = config.peers.iter().map(|p| p.name.clone()).collect();
-        tokio::spawn(clipboard::watch(links.clone(), peers.clone()));
+        tokio::spawn(clipboard::watch(links.clone()));
+        let me = server.then(|| pair::Me { name: config.name.clone(), port: config.listen.port(), fingerprint: identity.fingerprint() });
+        let (ctl_links, ctl_control) = (links.clone(), control_tx.clone());
         tokio::spawn(async move {
-            if let Err(e) = ctl::serve(control_tx, peers).await {
+            if let Err(e) = ctl::serve(ctl_control, ctl_links, me).await {
                 tracing::warn!("no control socket: {e}");
             }
         });
-        let net = link::endpoint(&config, &identity)?;
+        let net = link::endpoint(&config, &identity, links.clone())?;
         let (to_display, display_events) = tokio::sync::mpsc::unbounded_channel();
         // Video connections the peer opens to us, handed to the display side.
         let (video_in, mut videos) = tokio::sync::mpsc::unbounded_channel();
@@ -286,7 +396,7 @@ fn daemon(
             config.display.clone(),
             config_path.clone(),
             net.clone(),
-            config.peers[0].clone(),
+            extend_target(&config),
             links.clone(),
             status.clone(),
             display_events,
@@ -295,12 +405,14 @@ fn daemon(
         tokio::spawn(display::show(links.clone(), status.clone(), display_events));
         let network = tokio::spawn(link::run(
             config.clone(),
+            config_path.clone(),
             net,
             links.clone(),
             status.clone(),
             to_session,
             link_up,
             video_in,
+            control_tx,
         ));
         tokio::select! {
             result = input::session(config, config_path, links, status, from_links, link_state, control, to_display) => result,
@@ -308,6 +420,19 @@ fn daemon(
             _ = tokio::signal::ctrl_c() => Ok(()),
         }
     })
+}
+
+/// Every configured peer starts offline, or off if it is switched off here.
+fn mark_all(status: &status::Status, config: &Config) {
+    let server = config.role == Role::Server;
+    for peer in &config.peers {
+        status.offline(&peer.name);
+        if server && !peer.enabled {
+            status.set_peer(&peer.name, |p| p.mode = "off".into());
+        }
+    }
+    let extending = extend_target(config).map(|p| p.name).unwrap_or_default();
+    status.set(|s| s.extending = extending);
 }
 
 fn load(path: &Path) -> Result<Config> {
@@ -390,26 +515,35 @@ fn main() -> Result<()> {
         }
         Cmd::Run => {
             let config = load(&path)?;
-            if config.peers.is_empty() {
-                bail!("no peers in {}", path.display());
+            if config.peers.is_empty() && config.role == Role::Client {
+                bail!("no server in {}: pair with one using the `glide join …` command its invite prints", path.display());
             }
             let identity = link::Identity::load_or_create(&config_dir())?;
             let status = Arc::new(status::Status::default());
-            for peer in &config.peers {
-                status.offline(&peer.name);
-            }
+            mark_all(&status, &config);
             let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
             daemon(config, path, identity, status, control_rx, control_tx)?;
         }
         Cmd::Ctl { words } => println!("{}", ctl::send(words)?),
-        Cmd::Status { json, watch, icon } => loop {
-            let state = status::read();
-            println!("{}", if *json { state.json(*icon) } else { state.summary() });
-            if !watch {
-                break;
+        Cmd::Invite => println!("{}", ctl::send(&["invite".to_string()])?),
+        Cmd::Join { token, name } => {
+            tokio::runtime::Runtime::new()?.block_on(pair::join(token, name.clone(), &path, &config_dir()))?;
+        }
+        Cmd::Status { json, watch, icon } => {
+            let mut last = String::new();
+            loop {
+                let state = status::read();
+                let line = if *json { state.json(*icon) } else { state.summary() };
+                if line != last {
+                    println!("{line}");
+                    last = line;
+                }
+                if !watch {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        },
+        }
         #[cfg(target_os = "macos")]
         Cmd::Snapshot { out, side } => {
             let config = load(&path)?;
@@ -429,7 +563,7 @@ fn main() -> Result<()> {
                 .enumerate()
                 .map(|(i, p)| {
                     let theirs = vec![screens::Screen { name: "HDMI-A-1".into(), x: 0, y: 0, w: 1920, h: 1080 }];
-                    arrange::PeerView::new(p.name.clone(), theirs, if i == 0 { side } else { p.position }, p.display, i)
+                    arrange::PeerView::new(p.name.clone(), theirs, if i == 0 { side } else { p.position }, p.display)
                 })
                 .collect();
             arrange::snapshot(mtm, screens::local(), peers, out)?;
@@ -438,13 +572,10 @@ fn main() -> Result<()> {
         #[cfg(target_os = "macos")]
         Cmd::App => {
             let config = load(&path)?;
-            let name = config.peers.first().context("no peers in the config")?.name.clone();
-            let mode = config.display.mode;
             let identity = link::Identity::load_or_create(&config_dir())?;
+            let me = pair::Me { name: config.name.clone(), port: config.listen.port(), fingerprint: identity.fingerprint() };
             let status = Arc::new(status::Status::default());
-            for peer in &config.peers {
-                status.offline(&peer.name);
-            }
+            mark_all(&status, &config);
             let (control_tx, control_rx) = tokio::sync::mpsc::unbounded_channel();
             let background = (config, path.clone(), identity, status.clone(), control_tx.clone());
             std::thread::spawn(move || {
@@ -454,8 +585,7 @@ fn main() -> Result<()> {
                 }
             });
             // AppKit owns the main thread from here.
-            let clients = config_clients(&path)?;
-            menubar::run(status, control_tx, path, name, mode, clients)?;
+            menubar::run(status, control_tx, path, me)?;
         }
     }
     Ok(())
@@ -499,5 +629,47 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert!(!text.contains("enabled"), "on is the default and stays out of the file: {text}");
+    }
+
+    fn screen(x: i32, y: i32, w: u32, h: u32) -> screens::Screen {
+        screens::Screen { name: "s".into(), x, y, w, h }
+    }
+
+    #[test]
+    fn a_new_device_lands_on_a_free_outer_edge() {
+        // The LG and the portrait Dell to its right: the LG's right edge is the
+        // Dell, so it is never offered.
+        let screens = [screen(0, 0, 2560, 1080), screen(2560, 0, 1080, 1920)];
+        let peer = |side, display| Peer { name: "p".into(), addrs: vec![], fingerprint: String::new(), position: side, display, enabled: true };
+        assert_eq!(free_edge(&[], &screens), (Side::Left, Some(1)));
+        let taken = [peer(Side::Top, Some(1)), peer(Side::Left, Some(1))];
+        assert_eq!(free_edge(&taken, &screens), (Side::Bottom, Some(1)));
+        let more = [peer(Side::Top, Some(1)), peer(Side::Left, Some(1)), peer(Side::Bottom, Some(1))];
+        assert_eq!(free_edge(&more, &screens), (Side::Right, Some(2)), "the Dell's outer right edge next");
+        assert_eq!(free_edge(&[], &[]), (Side::Left, Some(1)), "no screens known: any edge counts");
+    }
+
+    #[test]
+    fn pairing_adds_or_rekeys_and_forgetting_removes() {
+        let path = std::env::temp_dir().join(format!("glide-config-pair-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            "name = \"goldengate\"\nrole = \"server\"\n[display]\nmode = \"extend\"\n\
+             [[peer]]\nname = \"anorak\"\naddrs = [\"192.168.2.3:4242\"]\nposition = \"top\"\ndisplay = 1\nfingerprint = \"aa\"\n",
+        )
+        .unwrap();
+        assert_eq!(extend_target(&load(&path).unwrap()).map(|p| p.name), Some("anorak".into()), "old mode = extend means the first peer");
+        let screens = [screen(0, 0, 2560, 1080)];
+        let added = add_peer(&path, "nullbyte", "bb", "192.168.0.7:4242".parse().unwrap(), &screens).unwrap();
+        assert_eq!((added.position, added.display), (Side::Left, Some(1)));
+        let rekeyed = add_peer(&path, "anorak", "cc", "192.168.0.9:4242".parse().unwrap(), &screens).unwrap();
+        assert_eq!((rekeyed.fingerprint.as_str(), rekeyed.position), ("cc", Side::Top), "same name: new key, same place");
+        assert_eq!(rekeyed.addrs[0], "192.168.0.9:4242".parse().unwrap());
+        set_extend(&path, Some("nullbyte")).unwrap();
+        forget_peer(&path, "nullbyte").unwrap();
+        let config = load(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(config.peers.len(), 1);
+        assert_eq!(extend_target(&config).map(|p| p.name), None, "forgetting the extended device stops extending");
     }
 }

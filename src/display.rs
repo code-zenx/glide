@@ -43,8 +43,13 @@ pub enum Mode {
 /// `[display]` in the server's config. A client ignores it: it is told.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Settings {
+    /// Old configs say `mode = "extend"` and mean the first peer; new ones
+    /// name the device in `extend`. Read through `crate::extend_target`.
     #[serde(default)]
     pub mode: Mode,
+    /// The device showing the extended display, by name; absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extend: Option<String>,
     /// Which of the client's workspaces shows the display.
     #[serde(default = "default_workspace")]
     pub workspace: u8,
@@ -70,6 +75,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             mode: Mode::Control,
+            extend: None,
             workspace: default_workspace(),
             bitrate_mbps: default_bitrate(),
             hidpi: false,
@@ -80,9 +86,9 @@ impl Default for Settings {
 /// Everything the display side of the daemon hears about, funnelled through
 /// the input session, which already sees every link change and message.
 pub enum Event {
-    /// The menu bar switched modes.
+    /// Show the display on this device now, or on none.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    Mode(Mode),
+    Target(Option<crate::Peer>),
     Link(#[cfg_attr(not(target_os = "macos"), allow(dead_code))] String, bool),
     Msg(String, Msg),
     /// A peer opened a video connection to us.
@@ -277,14 +283,19 @@ pub async fn host(
     settings: Settings,
     config_path: std::path::PathBuf,
     net: crate::link::Net,
-    peer: crate::Peer,
+    mut peer: Option<crate::Peer>,
     links: Arc<crate::link::Links>,
     status: Arc<crate::status::Status>,
     mut events: tokio::sync::mpsc::UnboundedReceiver<Event>,
 ) {
     use tracing::{info, warn};
 
-    let mut host = Host { mode: settings.mode, linked: false, workspace: settings.workspace, running: None };
+    let mode = if peer.is_some() { Mode::Extend } else { Mode::Control };
+    let mut host = Host { mode, linked: false, workspace: settings.workspace, running: None };
+    // A new target is switched to in two steps: the old one is stopped and
+    // told so under its own name, then the new one is asked.
+    let mut next: Option<Option<crate::Peer>> = None;
+    let named = |peer: &Option<crate::Peer>, name: &str| peer.as_ref().is_some_and(|p| p.name == name);
     let bitrate = settings.bitrate_mbps.saturating_mul(1_000_000);
     let mut running: Option<(crate::display_mac::Capture, tokio::task::JoinHandle<()>)> = None;
     let mut grace: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
@@ -292,16 +303,23 @@ pub async fn host(
     say(String::new());
 
     loop {
-        let steps = tokio::select! {
+        let mut steps = tokio::select! {
             event = events.recv() => match event {
                 None => break,
-                Some(Event::Mode(mode)) => host.mode(mode),
-                Some(Event::Link(name, up)) if name == peer.name => {
+                Some(Event::Target(target)) => {
+                    if target.as_ref().map(|t| &t.name) == peer.as_ref().map(|p| &p.name) {
+                        vec![]
+                    } else {
+                        next = Some(target);
+                        host.mode(Mode::Control)
+                    }
+                }
+                Some(Event::Link(name, up)) if named(&peer, &name) => {
                     tracing::debug!(peer = %name, up, "display sees the link");
                     if up { grace = None; }
                     host.link(up)
                 }
-                Some(Event::Msg(name, Msg::DisplayReady(answer))) if name == peer.name => {
+                Some(Event::Msg(name, Msg::DisplayReady(answer))) if named(&peer, &name) => {
                     if let Err(why) = &answer {
                         warn!(peer = %name, "cannot show the display: {why}");
                         say(format!("⚠ {name}: {why}"));
@@ -315,11 +333,21 @@ pub async fn host(
                 host.grace_over()
             }
         };
+        loop {
         for step in steps {
+            let target = peer.clone().unwrap_or_else(|| crate::Peer {
+                name: String::new(),
+                addrs: vec![],
+                fingerprint: String::new(),
+                position: crate::Side::Top,
+                display: None,
+                enabled: false,
+            });
             match step {
+                Step::Ask(_) | Step::Start(_) if peer.is_none() => {}
                 Step::Ask(show) => {
-                    info!(peer = %peer.name, ?show, "asking the peer about the display");
-                    links.send(&peer.name, Msg::Display(show));
+                    info!(peer = %target.name, ?show, "asking the peer about the display");
+                    links.send(&target.name, Msg::Display(show));
                 }
                 Step::StopLater => grace = Some(Box::pin(tokio::time::sleep(GRACE))),
                 Step::Stop => {
@@ -338,25 +366,35 @@ pub async fn host(
                     // moved the peer since.
                     let at = crate::load(&config_path)
                         .ok()
-                        .and_then(|c| c.peers.into_iter().find(|p| p.name == peer.name))
-                        .unwrap_or_else(|| peer.clone());
+                        .and_then(|c| c.peers.into_iter().find(|p| p.name == target.name))
+                        .unwrap_or_else(|| target.clone());
                     let place = crate::display_mac::Place { side: at.position, display: at.display };
                     match crate::display_mac::Capture::start(screen, place, settings.hidpi, bitrate, slot.clone()) {
                         Ok(capture) => {
                             info!(w = screen.w, h = screen.h, hz = screen.hz, "extended display on");
                             say(format!("Extended: {}×{} at {} Hz", screen.w, screen.h, screen.hz));
-                            let sender = tokio::spawn(stream(net.clone(), peer.clone(), slot));
+                            let sender = tokio::spawn(stream(net.clone(), target.clone(), slot));
                             running = Some((capture, sender));
                         }
                         Err(e) => {
                             warn!("cannot start the extended display: {e:#}");
                             say(format!("⚠ {e}"));
                             host.running = None;
-                            links.send(&peer.name, Msg::Display(Show::Off));
+                            links.send(&target.name, Msg::Display(Show::Off));
                         }
                     }
                 }
             }
+        }
+        // The old target is stopped; now switch and ask the new one.
+        let Some(target) = next.take() else { break };
+        peer = target;
+        grace = None;
+        host.linked = peer.as_ref().is_some_and(|p| links.connected(&p.name));
+        if !status.snapshot().display.starts_with('⚠') || peer.is_none() {
+            say(String::new());
+        }
+        steps = if peer.is_some() { host.mode(Mode::Extend) } else { vec![] };
         }
     }
 }
@@ -500,9 +538,11 @@ mod tests {
             display: Settings::default(),
             peers: vec![Peer { name: "peer".into(), addrs, fingerprint: peer.fingerprint(), position: Side::Right, display: None, enabled: true }],
         };
-        let receiver = endpoint(&config(&id_mac, vec![]), &id_linux)?;
+        let trusting = |c: &Config| Arc::new(crate::link::Links::new(c.peers.clone(), false));
+        let (here, there) = (config(&id_mac, vec![]), config(&id_linux, vec![]));
+        let receiver = endpoint(&here, &id_linux, trusting(&here))?;
         let addr = receiver.endpoint.local_addr()?;
-        let sender = endpoint(&config(&id_linux, vec![addr]), &id_mac)?;
+        let sender = endpoint(&there, &id_mac, trusting(&there))?;
         let peer = config(&id_linux, vec![addr]).peers.remove(0);
 
         let frames: Vec<Frame> = (0..50u8)

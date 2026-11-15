@@ -64,13 +64,11 @@ pub struct PeerView {
     pub side: Cell<Side>,
     /// Which of this Mac's displays the edge belongs to, counting from 1.
     pub display: Cell<Option<usize>>,
-    /// The peer's index in the config, which is its handle in the session.
-    pub handle: usize,
 }
 
 impl PeerView {
-    pub fn new(name: String, screens: Vec<Screen>, side: Side, display: Option<usize>, handle: usize) -> Self {
-        Self { name, screens, side: Cell::new(side), display: Cell::new(display), handle }
+    pub fn new(name: String, screens: Vec<Screen>, side: Side, display: Option<usize>) -> Self {
+        Self { name, screens, side: Cell::new(side), display: Cell::new(display) }
     }
 }
 
@@ -178,7 +176,7 @@ impl ArrangeView {
             if let Err(e) = crate::set_position(&state.config_path, &peer.name, side, display) {
                 tracing::warn!("cannot save the new arrangement: {e}");
             }
-            let _ = state.control.send(Control::SetPosition(peer.handle as _, side, display));
+            let _ = state.control.send(Control::SetPosition(peer.name.clone(), side, display));
         }
         self.setNeedsDisplay(true);
     }
@@ -689,8 +687,8 @@ mod tests {
     #[test]
     fn each_peer_parks_on_its_own_edge() {
         let local = vec![(rect(0.0, 0.0, 1000.0, 600.0), String::new())];
-        let top = PeerView::new("anorak".into(), vec![], Side::Top, None, 0);
-        let right = PeerView::new("anton".into(), vec![], Side::Right, None, 1);
+        let top = PeerView::new("anorak".into(), vec![], Side::Top, None);
+        let right = PeerView::new("anton".into(), vec![], Side::Right, None);
         let (t, r) = (park(&local, &top)[0].0, park(&local, &right)[0].0);
         assert_eq!(t.origin.y + t.size.height, 0.0, "anorak sits right above");
         assert_eq!(r.origin.x, 1000.0, "anton sits right of the Mac");

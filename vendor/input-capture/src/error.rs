@@ -137,8 +137,8 @@ pub enum LayerShellCaptureCreationError {
 #[cfg(x11)]
 #[derive(Debug, Error)]
 pub enum X11InputCaptureCreationError {
-    #[error("X11 input capture is not yet implemented :(")]
-    NotImplemented,
+    #[error("cannot open the X display, is DISPLAY set?")]
+    NoDisplay,
 }
 
 #[cfg(target_os = "macos")]

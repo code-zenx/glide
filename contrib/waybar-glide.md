@@ -1,7 +1,7 @@
 # waybar glide indicator
 
 Shows glide link state in waybar. `glide status --json --watch` emits one waybar JSON
-object per second; waybar applies the `class` field (`local`, `sending`, `receiving`,
+object per change; waybar applies the `class` field (`local`, `sending`, `receiving`,
 `offline`) to the module widget.
 
 ## Module (`~/.config/waybar/config.jsonc`)

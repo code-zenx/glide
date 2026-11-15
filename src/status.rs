@@ -14,17 +14,20 @@ use crate::screens::Screen;
 #[derive(Clone, Debug, PartialEq)]
 pub struct PeerState {
     pub name: String,
-    /// The link: `offline` or `local` (linked, input not flowing to or from it).
+    /// The link: `offline`, `local` (linked, input not flowing to or from
+    /// it), or `off` (switched off on the server; on a client, by the server).
     pub mode: String,
     pub rtt_ms: Option<f64>,
-    /// The server has switched this peer off; the link stays up so both ends
-    /// can say so, but no input or clipboard crosses.
+    /// The client paused itself from its own bar: linked, but not to be driven.
     pub paused: bool,
+    /// Whether the peer can show the extended display. Only the server's menu
+    /// reads it, in process, so it is not in the status file.
+    pub can_extend: bool,
 }
 
 impl PeerState {
     pub fn new(name: &str) -> Self {
-        Self { name: name.to_string(), mode: "offline".into(), rtt_ms: None, paused: false }
+        Self { name: name.to_string(), mode: "offline".into(), rtt_ms: None, paused: false, can_extend: true }
     }
 }
 
@@ -42,11 +45,21 @@ pub struct State {
     pub denied: bool,
     /// What the extended display is doing, in words; empty when it is off.
     pub display: String,
+    /// The device chosen to show the extended display, if any. Server only,
+    /// in process, like `can_extend`.
+    pub extending: String,
 }
 
 impl Default for State {
     fn default() -> Self {
-        Self { peers: Vec::new(), flow: "local".into(), active: String::new(), denied: false, display: String::new() }
+        Self {
+            peers: Vec::new(),
+            flow: "local".into(),
+            active: String::new(),
+            denied: false,
+            display: String::new(),
+            extending: String::new(),
+        }
     }
 }
 
@@ -105,10 +118,33 @@ impl State {
         self.focus().is_some_and(|p| p.paused) && self.mode() == "local"
     }
 
+    /// The one line at the top of the server's menu, first match wins.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub fn menu_summary(&self) -> String {
+        let linked = self.peers.iter().filter(|p| p.mode == "local").count();
+        if self.denied {
+            "Input permission needed".into()
+        } else if self.flow == "sending" && !self.active.is_empty() {
+            let rtt = self.peers.iter().find(|p| p.name == self.active).and_then(|p| p.rtt_ms);
+            rtt.map_or(format!("Controlling {}", self.active), |r| format!("Controlling {}  ·  {r:.1} ms", self.active))
+        } else if !self.extending.is_empty() && !self.display.is_empty() && !self.display.starts_with('⚠') {
+            format!("{} is a second screen", self.extending)
+        } else if linked > 0 {
+            format!("Linked to {linked} device{}", if linked == 1 { "" } else { "s" })
+        } else if self.peers.is_empty() {
+            "No devices yet".into()
+        } else {
+            "Not connected".into()
+        }
+    }
+
     /// One line fit for a menu bar or a status bar.
     pub fn summary(&self) -> String {
         if self.denied {
             return "⚠ needs permission".into();
+        }
+        if self.mode() == "off" {
+            return "○ off".into();
         }
         if self.paused() {
             return "Ⅱ paused".into();
@@ -119,40 +155,6 @@ impl State {
             ("local", Some(rtt)) => format!("● {rtt:.1}ms"),
             ("local", None) => "● linked".into(),
             _ => "✕ offline".into(),
-        }
-    }
-
-    /// Who this machine is linked to, and whether it is linked at all.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub fn headline(&self) -> String {
-        match self.mode().as_str() {
-            _ if self.denied => "Input permission needed".into(),
-            "offline" => "Not connected".into(),
-            _ if self.paused() => format!("{} is paused", self.peer()),
-            _ => format!("Linked to {}", self.peer()),
-        }
-    }
-
-    /// Which way input is flowing right now.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub fn flow(&self) -> String {
-        if self.denied {
-            return "Grant Input Monitoring and Device Control".into();
-        }
-        match self.mode().as_str() {
-            "sending" => format!("You are controlling {}", self.peer()),
-            "receiving" => format!("{} is controlling this Mac", self.peer()),
-            "local" => "Input stays on this Mac".into(),
-            _ => format!("Looking for {}", self.peer()),
-        }
-    }
-
-    /// The round trip, spelled out.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    pub fn speed(&self) -> String {
-        match self.rtt_ms() {
-            Some(rtt) => format!("{rtt:.2} ms round trip"),
-            None => "No timing yet".into(),
         }
     }
 
@@ -168,6 +170,7 @@ impl State {
             "sending" => format!("glide: controlling {}, {rtt}", self.peer()),
             "receiving" => format!("glide: {} is controlling this machine, {rtt}", self.peer()),
             "local" => format!("glide: linked to {}, input is local, {rtt}", self.peer()),
+            "off" => format!("glide: turned off by {}", self.peer()),
             _ => "glide: no peer connected".into(),
         }
     }
@@ -192,10 +195,11 @@ impl State {
             })
             .collect();
         format!(
-            r#"{{"text":"{}","tooltip":"{}","class":"{}","peers":[{}]}}"#,
+            r#"{{"text":"{}","tooltip":"{}","class":"{}","display":"{}","peers":[{}]}}"#,
             escape(&text),
             escape(&self.tooltip()),
             escape(&self.class()),
+            escape(&self.display),
             peers.join(",")
         )
     }
@@ -204,6 +208,8 @@ impl State {
     pub fn class(&self) -> String {
         if self.denied {
             "denied".into()
+        } else if self.mode() == "off" {
+            "off".into()
         } else if self.paused() {
             "paused".into()
         } else {
@@ -245,6 +251,7 @@ impl State {
                         mode: mode.to_string(),
                         rtt_ms: rtt.parse().ok(),
                         paused: paused == "true",
+                        can_extend: true,
                     }),
                     _ => old_peer = Some(value.to_string()),
                 },
@@ -259,7 +266,7 @@ impl State {
                 state.flow = mode.clone();
                 state.active = name.clone();
             }
-            state.peers.push(PeerState { name, mode: link.into(), rtt_ms: old_rtt, paused: false });
+            state.peers.push(PeerState { name, mode: link.into(), rtt_ms: old_rtt, paused: false, can_extend: true });
         }
         state
     }
@@ -352,6 +359,12 @@ impl Status {
     }
 
     /// Whether this machine can capture and type at all.
+    /// A forgotten device leaves the menu and the status file.
+    pub fn remove_peer(&self, peer: &str) {
+        self.set(|s| s.peers.retain(|p| p.name != peer));
+        self.peer_screens.lock().unwrap().remove(peer);
+    }
+
     pub fn allowed(&self, allowed: bool) {
         self.set(|s| s.denied = !allowed);
     }
@@ -371,7 +384,7 @@ mod tests {
     use super::*;
 
     fn peer(name: &str, mode: &str, rtt_ms: Option<f64>) -> PeerState {
-        PeerState { name: name.into(), mode: mode.into(), rtt_ms, paused: false }
+        PeerState { name: name.into(), mode: mode.into(), rtt_ms, paused: false, can_extend: true }
     }
 
     fn one(mode: &str, rtt_ms: Option<f64>, denied: bool) -> State {
@@ -379,14 +392,14 @@ mod tests {
             "sending" | "receiving" => ("local", mode, "mybox"),
             other => (other, "local", ""),
         };
-        State { peers: vec![peer("mybox", link, rtt_ms)], flow: flow.into(), active: active.into(), denied, display: String::new() }
+        State { peers: vec![peer("mybox", link, rtt_ms)], flow: flow.into(), active: active.into(), denied, ..State::default() }
     }
 
     #[test]
     fn survives_a_round_trip() {
         let mut state = one("sending", Some(1.844), true);
         state.display = "Extended: 1920×1080 at 120 Hz".into();
-        state.peers.push(PeerState { name: "anton".into(), mode: "local".into(), rtt_ms: None, paused: true });
+        state.peers.push(PeerState { name: "anton".into(), mode: "local".into(), rtt_ms: None, paused: true, can_extend: true });
         assert_eq!(State::decode(&state.encode()), state);
     }
 
@@ -421,7 +434,33 @@ mod tests {
         // A linked peer beats an offline one listed first.
         let state = State { peers: vec![peer("anorak", "offline", None), peer("anton", "local", None)], ..State::default() };
         assert_eq!(state.summary(), "● linked");
-        assert_eq!(state.headline(), "Linked to anton");
+        assert_eq!(state.menu_summary(), "Linked to 1 device");
+    }
+
+    #[test]
+    fn the_menu_summary_follows_what_matters_most() {
+        let mut state = State {
+            peers: vec![peer("anorak", "local", Some(1.7)), peer("nullbyte", "local", Some(3.5)), peer("anton", "off", None)],
+            ..State::default()
+        };
+        assert_eq!(state.menu_summary(), "Linked to 2 devices");
+        state.extending = "anorak".into();
+        state.display = "Extended: 2560×1440 at 60 Hz".into();
+        assert_eq!(state.menu_summary(), "anorak is a second screen");
+        state.flow = "sending".into();
+        state.active = "nullbyte".into();
+        assert_eq!(state.menu_summary(), "Controlling nullbyte  ·  3.5 ms", "the cursor wins");
+        state.denied = true;
+        assert_eq!(state.menu_summary(), "Input permission needed");
+        assert_eq!(State::default().menu_summary(), "No devices yet");
+    }
+
+    #[test]
+    fn a_client_switched_off_says_so() {
+        let state = one("off", None, false);
+        assert_eq!(state.summary(), "○ off");
+        assert_eq!(state.class(), "off");
+        assert_eq!(State::decode(&state.encode()).peers[0].mode, "off", "survives the status file");
     }
 
     #[test]
