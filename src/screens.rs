@@ -104,7 +104,20 @@ fn hyprland() -> Vec<Screen> {
 #[cfg(not(target_os = "macos"))]
 fn xrandr() -> Vec<Screen> {
     let Ok(output) = std::process::Command::new("xrandr").arg("--listmonitors").output() else { return Vec::new() };
-    String::from_utf8_lossy(&output.stdout).lines().skip(1).filter_map(xrandr_monitor).collect()
+    xrandr_monitors(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Mirrored outputs (a laptop panel cloned to HDMI) are one screen to the
+/// cursor, so each spot on the desktop is listed once.
+#[cfg(not(target_os = "macos"))]
+fn xrandr_monitors(text: &str) -> Vec<Screen> {
+    let mut screens: Vec<Screen> = Vec::new();
+    for s in text.lines().skip(1).filter_map(xrandr_monitor) {
+        if !screens.iter().any(|o| (o.x, o.y, o.w, o.h) == (s.x, s.y, s.w, s.h)) {
+            screens.push(s);
+        }
+    }
+    screens
 }
 
 /// One line of `xrandr --listmonitors`: ` 0: +*HDMI-1 1920/528x1080/297+0+0  HDMI-1`.
@@ -149,6 +162,8 @@ mod tests {
         let screen = xrandr_monitor(" 1: +eDP-1 1920/309x1080/173+-1920+0  eDP-1").unwrap();
         assert_eq!(screen, Screen { name: "eDP-1".into(), x: -1920, y: 0, w: 1920, h: 1080 });
         assert!(xrandr_monitor("Monitors: 2").is_none());
+        let mirrored = "Monitors: 2\n 0: +*HDMI-1 1920/528x1080/297+0+0  HDMI-1\n 1: +eDP-1 1920/309x1080/173+0+0  eDP-1\n";
+        assert_eq!(xrandr_monitors(mirrored).len(), 1, "a mirror is one screen");
     }
 
     #[test]

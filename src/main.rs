@@ -211,10 +211,11 @@ pub fn set_position(path: &Path, peer_name: &str, side: Side, display: Option<us
     Ok(())
 }
 
-/// Every peer's name and place, for the arrange window.
+/// Every device that is switched on, with its place, for the arrange window.
+/// An Off device has no edge, so it has nothing to arrange.
 #[cfg(target_os = "macos")]
 pub fn arrange_peers(path: &Path) -> Result<Vec<(String, Side, Option<usize>)>> {
-    Ok(load(path)?.peers.into_iter().map(|p| (p.name, p.position, p.display)).collect())
+    Ok(load(path)?.peers.into_iter().filter(|p| p.enabled).map(|p| (p.name, p.position, p.display)).collect())
 }
 
 /// The device the extended display goes to, if any. An old config's
@@ -560,6 +561,7 @@ fn main() -> Result<()> {
             let peers = config
                 .peers
                 .iter()
+                .filter(|p| p.enabled)
                 .enumerate()
                 .map(|(i, p)| {
                     let theirs = vec![screens::Screen { name: "HDMI-A-1".into(), x: 0, y: 0, w: 1920, h: 1080 }];
