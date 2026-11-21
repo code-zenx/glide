@@ -1,3 +1,7 @@
+#[cfg(target_os = "macos")]
+mod audio_mac;
+#[cfg(not(target_os = "macos"))]
+mod capture_wayland;
 mod clipboard;
 mod ctl;
 mod display;
@@ -5,6 +9,8 @@ mod display;
 mod display_linux;
 #[cfg(target_os = "macos")]
 mod display_mac;
+#[cfg(target_os = "macos")]
+mod h264;
 mod input;
 mod link;
 #[cfg(target_os = "macos")]
@@ -15,6 +21,11 @@ mod pair;
 mod proto;
 mod screens;
 mod status;
+mod view;
+#[cfg(not(target_os = "macos"))]
+mod view_linux;
+#[cfg(target_os = "macos")]
+mod view_mac;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -86,7 +97,7 @@ enum Cmd {
         name: Option<String>,
     },
     /// Steer the running daemon: pause, resume, release, peer on|off|forget
-    /// <name>, extend <name>|off, invite
+    /// <name>, extend <name>|off, view <name>|off, invite
     Ctl {
         #[arg(required = true, trailing_var_arg = true)]
         words: Vec<String>,
@@ -384,12 +395,18 @@ fn daemon(
         });
         let net = link::endpoint(&config, &identity, links.clone())?;
         let (to_display, display_events) = tokio::sync::mpsc::unbounded_channel();
-        // Video connections the peer opens to us, handed to the display side.
+        let (to_view, view_events) = tokio::sync::mpsc::unbounded_channel();
+        // Media connections a peer opens to us: an extended display's goes to
+        // the display side, a View Screen one to the view side.
         let (video_in, mut videos) = tokio::sync::mpsc::unbounded_channel();
-        let forward = to_display.clone();
+        let (forward, forward_view) = (to_display.clone(), to_view.clone());
         tokio::spawn(async move {
             while let Some((peer, conn)) = videos.recv().await {
-                let _ = forward.send(display::Event::Video(peer, conn));
+                if link::is_view(&conn) {
+                    let _ = forward_view.send(view::Event::Conn(peer, conn));
+                } else {
+                    let _ = forward.send(display::Event::Video(peer, conn));
+                }
             }
         });
         #[cfg(target_os = "macos")]
@@ -404,6 +421,10 @@ fn daemon(
         ));
         #[cfg(not(target_os = "macos"))]
         tokio::spawn(display::show(links.clone(), status.clone(), display_events));
+        #[cfg(target_os = "macos")]
+        tokio::spawn(view::watch(net.clone(), links.clone(), control_tx.clone(), view_events));
+        #[cfg(not(target_os = "macos"))]
+        tokio::spawn(view::share(links.clone(), view_events));
         let network = tokio::spawn(link::run(
             config.clone(),
             config_path.clone(),
@@ -416,7 +437,7 @@ fn daemon(
             control_tx,
         ));
         tokio::select! {
-            result = input::session(config, config_path, links, status, from_links, link_state, control, to_display) => result,
+            result = input::session(config, config_path, links, status, from_links, link_state, control, to_display, to_view) => result,
             result = network => result?,
             _ = tokio::signal::ctrl_c() => Ok(()),
         }

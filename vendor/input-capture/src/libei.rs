@@ -576,6 +576,9 @@ impl LanMouseInputCapture for LibeiInputCapture {
     /// glide: the portal hands over whole-desktop capture zones; there is no
     /// per-display barrier to set here.
     async fn restrict_to_display(&mut self, _index: Option<usize>) {}
+    async fn begin(&mut self, _pos: Position) -> Result<bool, CaptureError> {
+        Ok(false)
+    }
 
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         let _ = self

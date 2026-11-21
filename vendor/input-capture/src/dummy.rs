@@ -36,6 +36,9 @@ impl Default for DummyInputCapture {
 impl Capture for DummyInputCapture {
     /// glide: this backend has no per-display barrier; the setting is ignored.
     async fn restrict_to_display(&mut self, _index: Option<usize>) {}
+    async fn begin(&mut self, _pos: Position) -> Result<bool, CaptureError> {
+        Ok(false)
+    }
     async fn create(&mut self, _pos: Position) -> Result<(), CaptureError> {
         Ok(())
     }

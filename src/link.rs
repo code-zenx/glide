@@ -13,7 +13,8 @@
 //! An extended display's video gets a **separate connection** altogether, told
 //! apart by its ALPN. A connection has one congestion window and one send
 //! buffer; sharing them with thirty megabits a second of video would put every
-//! key press in the queue behind it.
+//! key press in the queue behind it. View Screen gets one of its own the same
+//! way, with the roles reversed: the Mac dials, the peer sends.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -39,6 +40,9 @@ use crate::{Config, Peer};
 
 const ALPN: &[u8] = b"glide/0";
 const VIDEO_ALPN: &[u8] = b"glide-video/0";
+/// View Screen: the Mac dials the peer, and the peer streams its screen and
+/// sound back.
+const VIEW_ALPN: &[u8] = b"glide-view/0";
 /// `glide join`: a machine that is not trusted yet, presenting an invite.
 const PAIR_ALPN: &[u8] = b"glide-pair/0";
 /// Close code for "this server switched you off". The client stops dialing
@@ -52,8 +56,9 @@ const OFF_PROBE: Duration = Duration::from_secs(60);
 const DIAL_EVERY: Duration = Duration::from_secs(2);
 /// How much unacknowledged video may sit in the send buffer: a keyframe and a
 /// little. More only lets latency pile up inside quinn, out of sight of the
-/// frame dropping that is meant to stop exactly that.
-const VIDEO_SEND_WINDOW: u64 = 1 << 20;
+/// frame dropping that is meant to stop exactly that. A View Screen peer sends
+/// on a connection it accepted, so it sets this on the connection itself.
+pub(crate) const VIDEO_SEND_WINDOW: u64 = 1 << 20;
 const PING_INTERVAL: Duration = Duration::from_secs(1);
 const STATS_INTERVAL: Duration = Duration::from_secs(10);
 /// Enough samples for a meaningful p99 without keeping history forever.
@@ -340,6 +345,7 @@ impl ClientCertVerifier for Pinned {
 pub struct Net {
     pub endpoint: Endpoint,
     video: quinn::ClientConfig,
+    view: quinn::ClientConfig,
 }
 
 impl Net {
@@ -347,9 +353,24 @@ impl Net {
     /// that answers. Pinned exactly like the input link.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub async fn dial_video(&self, peer: &Peer) -> Result<Connection> {
+        self.dial_with(&self.video, peer).await
+    }
+
+    /// The same, for View Screen: the peer sends on it, the Mac only reads.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub async fn dial_view(&self, peer: &Peer) -> Result<Connection> {
+        self.dial_with(&self.view, peer).await
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    async fn dial_with(&self, config: &quinn::ClientConfig, peer: &Peer) -> Result<Connection> {
         let mut last = anyhow!("peer {} has no addresses", peer.name);
         for addr in &peer.addrs {
-            match self.endpoint.connect_with(self.video.clone(), *addr, "glide")?.await {
+            match self
+                .endpoint
+                .connect_with(config.clone(), *addr, "glide")?
+                .await
+            {
                 Ok(conn) => return Ok(conn),
                 Err(e) => last = anyhow!("{addr}: {e}"),
             }
@@ -372,7 +393,12 @@ pub fn endpoint(config: &Config, identity: &Identity, links: Arc<Links>) -> Resu
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(pinned.clone())
         .with_single_cert(certs, key)?;
-    server_crypto.alpn_protocols = vec![ALPN.to_vec(), VIDEO_ALPN.to_vec(), PAIR_ALPN.to_vec()];
+    server_crypto.alpn_protocols = vec![
+        ALPN.to_vec(),
+        VIDEO_ALPN.to_vec(),
+        VIEW_ALPN.to_vec(),
+        PAIR_ALPN.to_vec(),
+    ];
 
     let (certs, key) = identity.clone_parts();
     let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider)
@@ -380,9 +406,10 @@ pub fn endpoint(config: &Config, identity: &Identity, links: Arc<Links>) -> Resu
         .dangerous()
         .with_custom_certificate_verifier(pinned)
         .with_client_auth_cert(certs, key)?;
-    let mut video_crypto = client_crypto.clone();
+    let (mut video_crypto, mut view_crypto) = (client_crypto.clone(), client_crypto.clone());
     client_crypto.alpn_protocols = vec![ALPN.to_vec()];
     video_crypto.alpn_protocols = vec![VIDEO_ALPN.to_vec()];
+    view_crypto.alpn_protocols = vec![VIEW_ALPN.to_vec()];
 
     let mut transport = quinn::TransportConfig::default();
     transport.keep_alive_interval(Some(Duration::from_secs(2)));
@@ -391,7 +418,7 @@ pub fn endpoint(config: &Config, identity: &Identity, links: Arc<Links>) -> Resu
     video_transport.keep_alive_interval(Some(Duration::from_secs(2)));
     video_transport.max_idle_timeout(Some(Duration::from_secs(10).try_into()?));
     video_transport.send_window(VIDEO_SEND_WINDOW);
-    let transport = Arc::new(transport);
+    let (transport, video_transport) = (Arc::new(transport), Arc::new(video_transport));
 
     let mut server_config =
         quinn::ServerConfig::with_crypto(Arc::new(quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?));
@@ -402,10 +429,54 @@ pub fn endpoint(config: &Config, identity: &Identity, links: Arc<Links>) -> Resu
         quinn::ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?));
     client_config.transport_config(transport);
     endpoint.set_default_client_config(client_config);
-    let mut video =
-        quinn::ClientConfig::new(Arc::new(quinn::crypto::rustls::QuicClientConfig::try_from(video_crypto)?));
-    video.transport_config(Arc::new(video_transport));
-    Ok(Net { endpoint, video })
+    let mut video = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(video_crypto)?,
+    ));
+    video.transport_config(video_transport.clone());
+    let mut view = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(view_crypto)?,
+    ));
+    view.transport_config(video_transport);
+    Ok(Net {
+        endpoint,
+        video,
+        view,
+    })
+}
+
+/// Two endpoints on loopback that trust each other, for tests of the media
+/// connections: the one that listens, the one that dials, and the listener as
+/// the dialer's peer.
+#[cfg(test)]
+pub(crate) fn loopback(dir: &Path) -> Result<(Net, Net, Peer)> {
+    use crate::{Role, Side};
+
+    let (id_a, id_b) = (
+        Identity::load_or_create(&dir.join("a"))?,
+        Identity::load_or_create(&dir.join("b"))?,
+    );
+    let config = |peer: &Identity, addrs| Config {
+        name: "me".into(),
+        role: Role::Server,
+        listen: "127.0.0.1:0".parse().unwrap(),
+        display: Default::default(),
+        peers: vec![Peer {
+            name: "peer".into(),
+            addrs,
+            fingerprint: peer.fingerprint(),
+            position: Side::Right,
+            display: None,
+            enabled: true,
+        }],
+    };
+    let trusting = |c: &Config| Arc::new(Links::new(c.peers.clone(), false));
+    let (here, there) = (config(&id_a, vec![]), config(&id_b, vec![]));
+    let listener = endpoint(&here, &id_b, trusting(&here))?;
+    let dialer = endpoint(&there, &id_a, trusting(&there))?;
+    let peer = config(&id_b, vec![listener.endpoint.local_addr()?])
+        .peers
+        .remove(0);
+    Ok((listener, dialer, peer))
 }
 
 /// What `glide join` dials with: its own certificate, the server pinned to the
@@ -480,8 +551,10 @@ pub async fn run(
             let Some(name) = identify(&conn, &links.peers()) else {
                 return warn!(addr = %conn.remote_address(), "connected peer is not in the config");
             };
-            if alpn(&conn).as_deref() == Some(VIDEO_ALPN) {
-                info!(peer = %name, "extended display connected");
+            // Both kinds of media connection go the same way; `is_view`
+            // tells them apart where they arrive.
+            if matches!(alpn(&conn).as_deref(), Some(VIDEO_ALPN | VIEW_ALPN)) {
+                info!(peer = %name, view = is_view(&conn), "media connection");
                 let _ = video_in.send((name, conn));
                 return;
             }
@@ -513,6 +586,11 @@ fn alpn(conn: &Connection) -> Option<Vec<u8>> {
 #[cfg(test)]
 pub(crate) fn is_video(conn: &Connection) -> bool {
     alpn(conn).as_deref() == Some(VIDEO_ALPN)
+}
+
+/// A View Screen connection, as opposed to an extended display's.
+pub(crate) fn is_view(conn: &Connection) -> bool {
+    alpn(conn).as_deref() == Some(VIEW_ALPN)
 }
 
 fn identify(conn: &Connection, peers: &[Peer]) -> Option<String> {
@@ -801,16 +879,17 @@ async fn datagrams(
     }
 }
 
-async fn write_frame(send: &mut SendStream, bytes: &[u8]) -> Result<()> {
+/// `[u32 length][bytes]`. View Screen's sound uses it too.
+pub(crate) async fn write_frame(send: &mut SendStream, bytes: &[u8]) -> Result<()> {
     let len = u32::try_from(bytes.len()).context("frame too large")?;
     send.write_all(&len.to_be_bytes()).await?;
     send.write_all(bytes).await?;
     Ok(())
 }
 
-/// Not cancel-safe: only ever awaited by [`frames`], which has nothing else to
-/// race it against.
-async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
+/// Not cancel-safe: only ever awaited by a loop with nothing else to race it
+/// against, [`frames`] or View Screen's sound.
+pub(crate) async fn read_frame(recv: &mut RecvStream) -> Result<Vec<u8>> {
     let mut len = [0u8; 4];
     recv.read_exact(&mut len).await?;
     let len = u32::from_be_bytes(len) as usize;

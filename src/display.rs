@@ -125,7 +125,6 @@ struct SlotState {
 
 impl Slot {
     /// Called from the encoder's thread.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn push(&self, frame: Frame) {
         let mut state = self.state.lock().unwrap();
         if state.frame.is_some() {
@@ -143,7 +142,6 @@ impl Slot {
     }
 
     /// The next frame to send, waiting for one if there is none.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub async fn pop(&self) -> Frame {
         loop {
             if let Some(frame) = self.state.lock().unwrap().frame.take() {
@@ -154,7 +152,6 @@ impl Slot {
     }
 
     /// A new receiver knows nothing: start it from a keyframe.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn restart(&self) {
         let mut state = self.state.lock().unwrap();
         state.frame = None;
@@ -164,15 +161,53 @@ impl Slot {
 
     /// Whether the encoder should make its next frame a keyframe. Clears the
     /// request.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub fn take_key_request(&self) -> bool {
         self.want_key.swap(false, Ordering::Relaxed)
     }
 }
 
+/// Drain the slot into a stream until the stream fails. A new receiver knows
+/// nothing, so it starts from a keyframe. Extend sends this way from the Mac,
+/// View Screen from the Linux end.
+pub async fn send_frames(send: &mut SendStream, slot: &Slot) -> Result<()> {
+    slot.restart();
+    let mut count = 0u64;
+    loop {
+        let frame = slot.pop().await;
+        count += 1;
+        if count == 1 || count.is_multiple_of(600) {
+            tracing::info!(
+                count,
+                key = frame.key,
+                bytes = frame.data.len(),
+                "video frames sent"
+            );
+        }
+        write_frame(send, &frame).await?;
+    }
+}
+
+/// Hand every frame on a stream to `show` until the stream ends. Not
+/// cancel-safe, for the same reason `read_frame` is not.
+pub async fn recv_frames(recv: &mut RecvStream, mut show: impl FnMut(Frame)) -> Result<()> {
+    let mut count = 0u64;
+    loop {
+        let frame = read_frame(recv).await?;
+        count += 1;
+        if count == 1 || count.is_multiple_of(600) {
+            tracing::info!(
+                count,
+                key = frame.key,
+                bytes = frame.data.len(),
+                "video frames received"
+            );
+        }
+        show(frame);
+    }
+}
+
 /// `[u32 length][u8 keyframe][NAL units]`, on the video connection's one stream.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-async fn write_frame(send: &mut SendStream, frame: &Frame) -> Result<()> {
+pub(crate) async fn write_frame(send: &mut SendStream, frame: &Frame) -> Result<()> {
     let len = u32::try_from(frame.data.len() + 1)?;
     send.write_all(&len.to_be_bytes()).await?;
     send.write_all(&[frame.key as u8]).await?;
@@ -181,7 +216,6 @@ async fn write_frame(send: &mut SendStream, frame: &Frame) -> Result<()> {
 }
 
 /// Not cancel-safe: only awaited by a loop that has nothing to race it with.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
 async fn read_frame(recv: &mut RecvStream) -> Result<Frame> {
     let mut len = [0u8; 4];
     recv.read_exact(&mut len).await?;
@@ -408,16 +442,7 @@ async fn stream(net: crate::link::Net, peer: crate::Peer, slot: Arc<Slot>) {
             Ok(conn) => {
                 let sent = async {
                     let mut send = conn.open_uni().await?;
-                    slot.restart();
-                    let mut count = 0u64;
-                    loop {
-                        let frame = slot.pop().await;
-                        count += 1;
-                        if count == 1 || count.is_multiple_of(600) {
-                            tracing::info!(count, key = frame.key, bytes = frame.data.len(), "video frames sent");
-                        }
-                        write_frame(&mut send, &frame).await?;
-                    }
+                    send_frames(&mut send, &slot).await
                 };
                 let result: Result<()> = sent.await;
                 if let Err(e) = result {
@@ -489,15 +514,7 @@ pub async fn show(
                         let receiver = tokio::spawn(async move {
                             let result: Result<()> = async {
                                 let mut recv = conn.accept_uni().await?;
-                                let mut count = 0u64;
-                                loop {
-                                    let frame = read_frame(&mut recv).await?;
-                                    count += 1;
-                                    if count == 1 || count.is_multiple_of(600) {
-                                        info!(count, key = frame.key, bytes = frame.data.len(), "video frames received");
-                                    }
-                                    feeding.push(frame.data);
-                                }
+                                recv_frames(&mut recv, |frame| feeding.push(frame.data)).await
                             }
                             .await;
                             if let Err(e) = result {
@@ -526,24 +543,8 @@ mod tests {
     /// boundaries and keyframe flags included.
     #[tokio::test(flavor = "multi_thread")]
     async fn frames_cross_a_video_connection_intact() -> Result<()> {
-        use crate::link::{endpoint, Identity};
-        use crate::{Config, Peer, Role, Side};
-
         let dir = std::env::temp_dir().join(format!("glide-video-{}", std::process::id()));
-        let (id_mac, id_linux) = (Identity::load_or_create(&dir.join("mac"))?, Identity::load_or_create(&dir.join("linux"))?);
-        let config = |peer: &Identity, addrs| Config {
-            name: "me".into(),
-            role: Role::Server,
-            listen: "127.0.0.1:0".parse().unwrap(),
-            display: Settings::default(),
-            peers: vec![Peer { name: "peer".into(), addrs, fingerprint: peer.fingerprint(), position: Side::Right, display: None, enabled: true }],
-        };
-        let trusting = |c: &Config| Arc::new(crate::link::Links::new(c.peers.clone(), false));
-        let (here, there) = (config(&id_mac, vec![]), config(&id_linux, vec![]));
-        let receiver = endpoint(&here, &id_linux, trusting(&here))?;
-        let addr = receiver.endpoint.local_addr()?;
-        let sender = endpoint(&there, &id_mac, trusting(&there))?;
-        let peer = config(&id_linux, vec![addr]).peers.remove(0);
+        let (receiver, sender, peer) = crate::link::loopback(&dir)?;
 
         let frames: Vec<Frame> = (0..50u8)
             .map(|i| Frame { key: i % 10 == 0, data: vec![i; 1 + i as usize * 4000] })

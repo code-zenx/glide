@@ -31,7 +31,8 @@ pub enum Asked {
     Invite,
 }
 
-const USAGE: &str = "pause, resume, release, peer on|off|forget <name>, extend <name>|off, invite";
+const USAGE: &str =
+    "pause, resume, release, peer on|off|forget <name>, extend <name>|off, view <name>|off, invite";
 
 /// `names` is the current device list, so a typo is refused with a reason
 /// instead of silently doing nothing.
@@ -48,6 +49,8 @@ pub fn parse(line: &str, names: &[String]) -> Result<Asked> {
         ["peer", "forget", name] => Control::Forget(known(name)?),
         ["extend", "off"] => Control::Extend(None),
         ["extend", name] => Control::Extend(Some(known(name)?)),
+        ["view", "off"] => Control::View(None),
+        ["view", name] => Control::View(Some(known(name)?)),
         ["invite"] => return Ok(Asked::Invite),
         _ => bail!("unknown command {line:?} ({USAGE})"),
     }))
@@ -141,6 +144,8 @@ mod tests {
         assert!(matches!(control("peer forget anton"), Control::Forget(n) if n == "anton"));
         assert!(matches!(control("extend anorak"), Control::Extend(Some(n)) if n == "anorak"));
         assert!(matches!(control("extend off"), Control::Extend(None)));
+        assert!(matches!(control("view anorak"), Control::View(Some(n)) if n == "anorak"));
+        assert!(matches!(control("view off"), Control::View(None)));
         assert!(matches!(parse("invite", &names()).unwrap(), Asked::Invite));
     }
 
@@ -151,6 +156,7 @@ mod tests {
         assert!(parse("", &names()).is_err());
         assert!(parse("peer maybe anton", &names()).is_err());
         assert!(parse("extend nobody", &names()).is_err());
+        assert!(parse("view nobody", &names()).is_err());
     }
 
     #[test]

@@ -27,6 +27,7 @@ use crate::display;
 use crate::link::Links;
 use crate::proto::Msg;
 use crate::status::Status;
+use crate::view;
 use crate::{Config, Peer, Role, Side};
 
 /// Held together, these hand input back to this machine at once, even if the
@@ -228,6 +229,8 @@ pub enum Control {
     RetryBackends,
     /// Show the extended display on this device, or on none.
     Extend(Option<String>),
+    /// Show this device's screen fullscreen here and drive it, or stop.
+    View(Option<String>),
     /// Switch one peer off (or back on). Off: the link is closed and the
     /// peer told why; nothing crosses until it is switched on again.
     SetEnabled(String, bool),
@@ -243,11 +246,13 @@ pub enum Control {
 }
 
 /// Whether a peer's screen edge should be armed: only with a live link behind
-/// it, never while that peer is showing our extended display — the cursor
-/// then belongs on the virtual screen, not in the peer — and never while the
-/// peer is switched off. Other peers stay reachable while one extends.
-fn edge_wanted(linked: bool, extended_here: bool, enabled: bool) -> bool {
-    linked && !extended_here && enabled
+/// it, never while the two screens are one picture — on a server, the peer
+/// showing our extended display, where the cursor belongs on the virtual
+/// screen; on a client, the server viewing this screen, where an edge would
+/// walk the cursor out of the picture — and never while the peer is switched
+/// off. Other peers stay reachable meanwhile.
+fn edge_wanted(linked: bool, screen_shared: bool, enabled: bool) -> bool {
+    linked && !screen_shared && enabled
 }
 
 /// Whether this machine can show a server's extended display: the receiving
@@ -272,6 +277,32 @@ async fn hand_back(capture: &mut Option<InputCapture>, links: &Links, peer: &str
     links.send(peer, Msg::Leave);
     handover.take_back();
     release(capture.as_mut()).await
+}
+
+/// Take the cursor and start feeding `peer`, as crossing its edge does.
+fn enter(handover: &mut Handover, links: &Arc<Links>, handle: CaptureHandle, peer: &str) {
+    handover.began(handle);
+    links.send(peer, Msg::Enter);
+    push_clipboard(links, peer);
+}
+
+/// Hand `peer` the keyboard and mouse without the cursor crossing its edge,
+/// the way the toggle chord does. False when the capture cannot: no
+/// permission, or its edge is not armed (switched off, paused, extended).
+async fn begin_view(
+    capture: &mut Option<InputCapture>,
+    links: &Arc<Links>,
+    handover: &mut Handover,
+    (handle, peer): (CaptureHandle, &str),
+) -> Result<bool> {
+    let Some(capture) = capture.as_mut() else {
+        return Ok(false);
+    };
+    if !capture.begin(handle).await? {
+        return Ok(false);
+    }
+    enter(handover, links, handle, peer);
+    Ok(true)
 }
 
 /// The handle of a device that has not been forgotten.
@@ -300,6 +331,7 @@ pub async fn session(
     mut link_state: UnboundedReceiver<(String, bool)>,
     mut control: UnboundedReceiver<Control>,
     display: tokio::sync::mpsc::UnboundedSender<display::Event>,
+    view: tokio::sync::mpsc::UnboundedSender<view::Event>,
 ) -> Result<()> {
     // Handles are indices into these lists, so a forgotten device keeps its
     // slot (marked gone) until the next start: every other device's handle,
@@ -329,6 +361,8 @@ pub async fn session(
     } else {
         None
     };
+    // The device whose screen is shown here. Server only.
+    let mut viewing: Option<usize> = None;
     for i in 0..config.peers.len() {
         if let Some(emulation) = emulation.as_mut() {
             emulation.create(i as CaptureHandle).await;
@@ -358,6 +392,16 @@ pub async fn session(
         s.denied = degraded;
     });
     loop {
+        // A view lasts exactly as long as its device has the keyboard and
+        // mouse: whatever brings them home (the chord, a release, a dead link,
+        // a failed view) ends it too. Checked here because most arms below
+        // `continue`.
+        if let Some(i) = viewing.filter(|&i| handover.sending() != Some(i as CaptureHandle)) {
+            info!(peer = %names[i], "input is home, view stopped");
+            viewing = None;
+            status.set(|s| s.viewing.clear());
+            let _ = view.send(view::Event::Target(None));
+        }
         tokio::select! {
             captured = next_capture(capture.as_mut()) => match captured {
                 Some(Ok((handle, event))) => {
@@ -381,9 +425,7 @@ pub async fn session(
                             }
                             Crossing::Send => {
                                 info!(%peer, "cursor left this screen; {RELEASE_HINT} takes it back");
-                                handover.began(handle);
-                                links.send(peer, Msg::Enter);
-                                push_clipboard(&links, peer);
+                                enter(&mut handover, &links, handle, peer);
                             }
                         },
                         CaptureEvent::Input(event) => {
@@ -423,10 +465,11 @@ pub async fn session(
             change = link_state.recv() => {
                 let Some((peer, up)) = change else { break };
                 let _ = display.send(display::Event::Link(peer.clone(), up));
+                let _ = view.send(view::Event::Link(peer.clone(), up));
                 let Some(handle) = live(&names, &gone, &peer) else { continue };
                 linked[handle] = up;
                 if up && !server {
-                    links.send(&peer, Msg::Caps { extend: can_extend_here() });
+                    links.send(&peer, Msg::Caps { extend: can_extend_here(), view: view::can_share() });
                 }
                 // A client that was offline when it was moved in the Arrange
                 // window still has the old side; say it again on every link.
@@ -480,6 +523,41 @@ pub async fn session(
                                 armed[i] = want;
                                 set_edge(capture, i, peer, want).await?;
                             }
+                        }
+                    }
+                    publish(&names, &handover, degraded, &mut shown);
+                    continue;
+                }
+                if let Control::View(name) = asked {
+                    // One screen cannot both show the extended display and be
+                    // shown here; the menu stops Extend first.
+                    let viewable = |n: &str| live(&names, &gone, n).filter(|&i| linked[i] && extend != Some(i));
+                    let target = match name.as_deref().map(viewable) {
+                        _ if !server => continue,
+                        Some(None) => {
+                            warn!(peer = ?name, "cannot view it: not linked, or showing the extended display");
+                            continue;
+                        }
+                        target => target.flatten(),
+                    };
+                    if target == viewing {
+                        continue;
+                    }
+                    // Input comes home first; the check at the top of the loop
+                    // then ends the old view, if this starts no new one.
+                    if let Some(handle) = handover.sending() {
+                        hand_back(&mut capture, &links, &names[handle as usize].clone(), &mut handover).await?;
+                    }
+                    if let Some(i) = target {
+                        if begin_view(&mut capture, &links, &mut handover, (i as CaptureHandle, &names[i])).await? {
+                            info!(peer = %names[i], "viewing its screen; {RELEASE_HINT} stops");
+                            viewing = Some(i);
+                            status.set(|s| s.viewing = names[i].clone());
+                            let _ = view.send(view::Event::Target(Some(config.peers[i].clone())));
+                        } else {
+                            warn!(peer = %names[i], "cannot hand it the keyboard and mouse, so not viewing it");
+                            let why = "Glide needs input permission, and the device must not be paused.";
+                            crate::pair::notify(&format!("Glide cannot view {}", names[i]), why);
                         }
                     }
                     publish(&names, &handover, degraded, &mut shown);
@@ -735,12 +813,27 @@ pub async fn session(
                         }
                         publish(&names, &handover, degraded, &mut shown);
                     }
-                    Msg::Caps { extend: can } => {
-                        info!(%peer, can_extend = can, "peer described what it can do");
-                        status.set_peer(&peer, |p| p.can_extend = can);
+                    Msg::Caps { extend: can, view: can_view } => {
+                        info!(%peer, can_extend = can, can_view, "peer described what it can do");
+                        status.set_peer(&peer, |p| {
+                            p.can_extend = can;
+                            p.can_view = can_view;
+                        });
                     }
                     Msg::Display(_) | Msg::DisplayReady(_) => {
                         let _ = display.send(display::Event::Msg(peer, msg));
+                    }
+                    Msg::View(on) if !server => {
+                        let i = handle as usize;
+                        let want = edge_wanted(linked[i], on, enabled[i] && !held_off[i]);
+                        if let Some(capture) = capture.as_mut().filter(|_| want != armed[i]) {
+                            armed[i] = want;
+                            set_edge(capture, i, &config.peers[i], want).await?;
+                        }
+                        let _ = view.send(view::Event::Msg(peer, msg));
+                    }
+                    Msg::View(_) | Msg::ViewReady(_) => {
+                        let _ = view.send(view::Event::Msg(peer, msg));
                     }
                     Msg::Ping(_) | Msg::Pong(_) => {}
                 }

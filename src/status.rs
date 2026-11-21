@@ -23,11 +23,21 @@ pub struct PeerState {
     /// Whether the peer can show the extended display. Only the server's menu
     /// reads it, in process, so it is not in the status file.
     pub can_extend: bool,
+    /// Whether the peer can send its screen for View Screen. In process only,
+    /// like `can_extend`; false until the peer says otherwise.
+    pub can_view: bool,
 }
 
 impl PeerState {
     pub fn new(name: &str) -> Self {
-        Self { name: name.to_string(), mode: "offline".into(), rtt_ms: None, paused: false, can_extend: true }
+        Self {
+            name: name.to_string(),
+            mode: "offline".into(),
+            rtt_ms: None,
+            paused: false,
+            can_extend: true,
+            can_view: false,
+        }
     }
 }
 
@@ -48,6 +58,9 @@ pub struct State {
     /// The device chosen to show the extended display, if any. Server only,
     /// in process, like `can_extend`.
     pub extending: String,
+    /// The device whose screen this server is showing fullscreen, if any.
+    /// Server only, in process, like `extending`.
+    pub viewing: String,
 }
 
 impl Default for State {
@@ -59,6 +72,7 @@ impl Default for State {
             denied: false,
             display: String::new(),
             extending: String::new(),
+            viewing: String::new(),
         }
     }
 }
@@ -124,6 +138,8 @@ impl State {
         let linked = self.peers.iter().filter(|p| p.mode == "local").count();
         if self.denied {
             "Input permission needed".into()
+        } else if !self.viewing.is_empty() {
+            format!("Viewing {}", self.viewing)
         } else if self.flow == "sending" && !self.active.is_empty() {
             let rtt = self.peers.iter().find(|p| p.name == self.active).and_then(|p| p.rtt_ms);
             rtt.map_or(format!("Controlling {}", self.active), |r| format!("Controlling {}  ·  {r:.1} ms", self.active))
@@ -252,6 +268,7 @@ impl State {
                         rtt_ms: rtt.parse().ok(),
                         paused: paused == "true",
                         can_extend: true,
+                        can_view: false,
                     }),
                     _ => old_peer = Some(value.to_string()),
                 },
@@ -266,7 +283,11 @@ impl State {
                 state.flow = mode.clone();
                 state.active = name.clone();
             }
-            state.peers.push(PeerState { name, mode: link.into(), rtt_ms: old_rtt, paused: false, can_extend: true });
+            state.peers.push(PeerState {
+                mode: link.into(),
+                rtt_ms: old_rtt,
+                ..PeerState::new(&name)
+            });
         }
         state
     }
@@ -384,7 +405,11 @@ mod tests {
     use super::*;
 
     fn peer(name: &str, mode: &str, rtt_ms: Option<f64>) -> PeerState {
-        PeerState { name: name.into(), mode: mode.into(), rtt_ms, paused: false, can_extend: true }
+        PeerState {
+            mode: mode.into(),
+            rtt_ms,
+            ..PeerState::new(name)
+        }
     }
 
     fn one(mode: &str, rtt_ms: Option<f64>, denied: bool) -> State {
@@ -399,7 +424,11 @@ mod tests {
     fn survives_a_round_trip() {
         let mut state = one("sending", Some(1.844), true);
         state.display = "Extended: 1920×1080 at 120 Hz".into();
-        state.peers.push(PeerState { name: "anton".into(), mode: "local".into(), rtt_ms: None, paused: true, can_extend: true });
+        state.peers.push(PeerState {
+            mode: "local".into(),
+            paused: true,
+            ..PeerState::new("anton")
+        });
         assert_eq!(State::decode(&state.encode()), state);
     }
 
@@ -449,7 +478,17 @@ mod tests {
         assert_eq!(state.menu_summary(), "anorak is a second screen");
         state.flow = "sending".into();
         state.active = "nullbyte".into();
-        assert_eq!(state.menu_summary(), "Controlling nullbyte  ·  3.5 ms", "the cursor wins");
+        assert_eq!(
+            state.menu_summary(),
+            "Controlling nullbyte  ·  3.5 ms",
+            "the cursor wins"
+        );
+        state.viewing = "nullbyte".into();
+        assert_eq!(
+            state.menu_summary(),
+            "Viewing nullbyte",
+            "a view says so, not just that the cursor is there"
+        );
         state.denied = true;
         assert_eq!(state.menu_summary(), "Input permission needed");
         assert_eq!(State::default().menu_summary(), "No devices yet");

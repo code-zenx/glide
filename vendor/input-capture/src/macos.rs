@@ -158,6 +158,14 @@ impl InputCaptureState {
             .find(|p| self.active_clients.contains(p))
     }
 
+    /// glide: capture from where the cursor is now instead of from an edge.
+    /// The toggle chord and `begin` both come in this way.
+    fn hold_cursor(&mut self) -> bool {
+        let Some(here) = cursor_location() else { return false };
+        self.enter_position = Some(here);
+        true
+    }
+
     /// start the input capture by
     fn start_capture(&mut self, event: &CGEvent, position: Position) -> Result<(), CaptureError> {
         let mut location = event.location();
@@ -602,8 +610,8 @@ fn create_event_tap<'a>(
         } else if toggled {
             // glide: the cursor stays put and comes back where it was. Nothing
             // armed (no link, paused, extending) means there is nowhere to go.
-            if let (Some(new_pos), Some(here)) = (state.send_position(), cursor_location()) {
-                state.enter_position = Some(here);
+            let armed = state.send_position();
+            if let Some(new_pos) = armed.filter(|_| state.hold_cursor()) {
                 if let Err(e) = notify_tx.try_send(ProducerEvent::Grab(new_pos)) {
                     log::error!("cannot hide the cursor: {e}");
                 }
@@ -880,6 +888,19 @@ impl Capture for MacOSInputCapture {
     /// glide: confine the barriers to one display.
     async fn restrict_to_display(&mut self, index: Option<usize>) {
         self.state.lock().await.set_only_display(index);
+    }
+
+    /// glide: what the toggle chord does, on request. Sent through the same
+    /// queue as `release`, so a release asked for just before lands first.
+    async fn begin(&mut self, pos: Position) -> Result<bool, CaptureError> {
+        if !self.state.lock().await.hold_cursor() {
+            return Ok(false);
+        }
+        let notify_tx = self.notify_tx.clone();
+        tokio::task::spawn_local(async move {
+            let _ = notify_tx.send(ProducerEvent::Grab(pos)).await;
+        });
+        Ok(true)
     }
 
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {

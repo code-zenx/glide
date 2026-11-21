@@ -1,7 +1,7 @@
 //! The macOS face of glide: an icon in the menu bar, and a menu that lists
 //! every device with what it is doing. Each device's submenu switches it on
-//! or off, makes it the extended display, or forgets it; *Add Device…* copies
-//! an invite for a new one.
+//! or off, makes it the extended display, views its screen, or forgets it;
+//! *Add Device…* copies an invite for a new one.
 //!
 //! The daemon runs on its own thread in this same process, so the app has one
 //! identity for macOS to grant input permissions to, and one icon in the bar.
@@ -44,8 +44,22 @@ struct Device {
     on: Retained<NSMenuItem>,
     off: Retained<NSMenuItem>,
     extend: Retained<NSMenuItem>,
+    view: Retained<NSMenuItem>,
     /// What the row shows now, so an unchanged second redraws nothing.
-    shown: RefCell<(Dot, String, bool, bool, bool, bool)>,
+    shown: RefCell<Option<Shown>>,
+}
+
+/// Everything a row and its submenu show for one device.
+#[derive(PartialEq)]
+struct Shown {
+    dot: Dot,
+    text: String,
+    switched_on: bool,
+    extending: bool,
+    can_extend: bool,
+    reachable: bool,
+    viewing: bool,
+    can_view: bool,
 }
 
 pub struct Ivars {
@@ -142,6 +156,20 @@ define_class!(
             let _ = self.ivars().control.send(Control::Extend((!already).then_some(name)));
         }
 
+        /// Show this device's screen here, or stop if it already is. One
+        /// screen cannot both show the extended display and be shown here,
+        /// so viewing the extended device stops Extend first.
+        #[unsafe(method(deviceView:))]
+        fn device_view(&self, sender: &NSMenuItem) {
+            let Some(name) = self.device(sender) else { return };
+            let state = self.ivars().status.snapshot();
+            let control = &self.ivars().control;
+            if state.extending == name && state.viewing != name {
+                let _ = control.send(Control::Extend(None));
+            }
+            let _ = control.send(Control::View((state.viewing != name).then_some(name)));
+        }
+
         #[unsafe(method(deviceForget:))]
         fn device_forget(&self, sender: &NSMenuItem) {
             let (Some(name), Some(mtm)) = (self.device(sender), MainThreadMarker::new()) else { return };
@@ -211,6 +239,7 @@ enum Dot {
 fn describe(state: &State, peer: &PeerState) -> (Dot, String) {
     let extended = state.extending == peer.name && !state.display.is_empty() && !state.display.starts_with('⚠');
     match state.mode_of(peer).as_str() {
+        "sending" if state.viewing == peer.name => (Dot::Controlling, "viewing".into()),
         "sending" => (Dot::Controlling, "controlling".into()),
         "off" => (Dot::Off, "off".into()),
         "local" if peer.paused => (Dot::Paused, format!("paused on {}", peer.name)),
@@ -249,43 +278,79 @@ fn device_row(mtm: MainThreadMarker, target: &MenuTarget, index: usize, name: &s
     let on = item("On", sel!(deviceOn:));
     let off = item("Off", sel!(deviceOff:));
     let extend = item("Use as Extended Display", sel!(deviceExtend:));
+    let view = item("View Screen", sel!(deviceView:));
     let forget = item(&format!("Forget {name}…"), sel!(deviceForget:));
     submenu.addItem(&on);
     submenu.addItem(&off);
     submenu.addItem(&NSMenuItem::separatorItem(mtm));
     submenu.addItem(&extend);
+    submenu.addItem(&view);
     submenu.addItem(&NSMenuItem::separatorItem(mtm));
     submenu.addItem(&forget);
     row.setSubmenu(Some(&submenu));
-    let shown = RefCell::new((Dot::Offline, String::from("\u{0}"), false, false, false, false));
-    Device { name: name.to_string(), row, on, off, extend, shown }
+    Device {
+        name: name.to_string(),
+        row,
+        on,
+        off,
+        extend,
+        view,
+        shown: RefCell::new(None),
+    }
 }
 
 fn update_row(device: &Device, state: &State, peer: &PeerState) {
     let (dot, text) = describe(state, peer);
-    let switched_on = peer.mode != "off";
-    let extending = state.extending == peer.name;
-    let can_extend = peer.can_extend;
-    let reachable = matches!(peer.mode.as_str(), "local");
-    let now = (dot, text.clone(), switched_on, extending, can_extend, reachable);
-    if *device.shown.borrow() == now {
+    let now = Shown {
+        dot,
+        text,
+        switched_on: peer.mode != "off",
+        extending: state.extending == peer.name,
+        can_extend: peer.can_extend,
+        reachable: matches!(peer.mode.as_str(), "local"),
+        viewing: state.viewing == peer.name,
+        can_view: peer.can_view,
+    };
+    if device.shown.borrow().as_ref() == Some(&now) {
         return;
     }
-    device.row.setImage(dot_image(dot).as_deref());
-    device.row.setBadge(Some(&NSMenuItemBadge::initWithString(NSMenuItemBadge::alloc(), &NSString::from_str(&text))));
-    let tick = |on: bool| if on { NSControlStateValueOn } else { NSControlStateValueOff };
-    device.on.setState(tick(switched_on));
-    device.off.setState(tick(!switched_on));
-    device.extend.setState(tick(extending));
-    device.extend.setTitle(&NSString::from_str(if can_extend {
-        "Use as Extended Display"
+    device.row.setImage(dot_image(now.dot).as_deref());
+    device.row.setBadge(Some(&NSMenuItemBadge::initWithString(
+        NSMenuItemBadge::alloc(),
+        &NSString::from_str(&now.text),
+    )));
+    let tick = |on: bool| {
+        if on {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        }
+    };
+    device.on.setState(tick(now.switched_on));
+    device.off.setState(tick(!now.switched_on));
+    device.extend.setState(tick(now.extending));
+    device
+        .extend
+        .setTitle(&NSString::from_str(if now.can_extend {
+            "Use as Extended Display"
+        } else {
+            "Use as Extended Display — needs Hyprland"
+        }));
+    // Turning either off is always allowed; starting one needs a linked device
+    // that can do it.
+    device
+        .extend
+        .setEnabled(now.extending || (now.can_extend && now.reachable));
+    device.view.setState(tick(now.viewing));
+    device.view.setTitle(&NSString::from_str(if now.can_view {
+        "View Screen"
     } else {
-        "Use as Extended Display — needs Hyprland"
+        "View Screen — not supported there"
     }));
-    // Turning it off is always allowed; starting it needs a linked device that
-    // can show it.
-    device.extend.setEnabled(extending || (can_extend && reachable));
-    *device.shown.borrow_mut() = now;
+    device
+        .view
+        .setEnabled(now.viewing || (now.can_view && now.reachable));
+    *device.shown.borrow_mut() = Some(now);
 }
 
 /// Trigger the system's own permission prompts. macOS only shows each once per
@@ -507,6 +572,16 @@ mod tests {
         assert_eq!(describe(&s, &p), (Dot::Extended, "extended display".into()));
         s.flow = "sending".into();
         s.active = "anorak".into();
-        assert_eq!(describe(&s, &p).0, Dot::Controlling, "having the cursor wins");
+        assert_eq!(
+            describe(&s, &p).0,
+            Dot::Controlling,
+            "having the cursor wins"
+        );
+        s.viewing = "anorak".into();
+        assert_eq!(
+            describe(&s, &p),
+            (Dot::Controlling, "viewing".into()),
+            "a view says so"
+        );
     }
 }

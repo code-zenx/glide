@@ -44,9 +44,18 @@ pub enum Msg {
     /// owner pauses a client; the link stays up so both ends can show it.
     Paused(bool),
     /// What a client can do, sent once per connection: whether it can show
-    /// the server's extended display (Hyprland can, X11 cannot). A client too
-    /// old to send this is taken to be able.
-    Caps { extend: bool },
+    /// the server's extended display (Hyprland can, X11 cannot), and whether
+    /// it can send its own screen for View Screen. A client too old to send
+    /// this is taken to be able to extend; one too old to say `view` cannot.
+    Caps {
+        extend: bool,
+        view: bool,
+    },
+    /// "Send me your screen and sound" (or stop). Only a server sends this.
+    View(bool),
+    /// The client's answer to `View(true)`: the mode of the screen it will
+    /// send, or why it cannot.
+    ViewReady(Result<ScreenMode, String>),
 }
 
 /// What the server asks a client's screen to do with its extended display.
@@ -128,23 +137,34 @@ impl Msg {
                 out.push(10);
                 out.push(*workspace);
             }
-            Msg::DisplayReady(Ok(ScreenMode { w, h, hz })) => {
+            Msg::DisplayReady(Ok(mode)) => {
                 out.push(11);
-                for n in [w, h, hz] {
-                    out.extend_from_slice(&n.to_le_bytes());
-                }
+                encode_mode(mode, &mut out);
             }
             Msg::DisplayReady(Err(why)) => {
                 out.push(12);
+                out.extend_from_slice(why.as_bytes());
+            }
+            Msg::View(on) => {
+                out.push(15);
+                out.push(*on as u8);
+            }
+            Msg::ViewReady(Ok(mode)) => {
+                out.push(16);
+                encode_mode(mode, &mut out);
+            }
+            Msg::ViewReady(Err(why)) => {
+                out.push(17);
                 out.extend_from_slice(why.as_bytes());
             }
             Msg::Paused(on) => {
                 out.push(13);
                 out.push(*on as u8);
             }
-            Msg::Caps { extend } => {
+            Msg::Caps { extend, view } => {
                 out.push(14);
                 out.push(*extend as u8);
+                out.push(*view as u8);
             }
             Msg::Screens(screens) => {
                 out.push(6);
@@ -192,18 +212,37 @@ impl Msg {
                 other => bail!("unknown side {other}"),
             }),
             9 => Msg::Display(Show::Off),
-            10 => Msg::Display(Show::On { workspace: *rest.first().context("no workspace")? }),
-            11 => Msg::DisplayReady(Ok(ScreenMode {
-                w: u32_at(rest, 0)?,
-                h: u32_at(rest, 4)?,
-                hz: u32_at(rest, 8)?,
-            })),
+            10 => Msg::Display(Show::On {
+                workspace: *rest.first().context("no workspace")?,
+            }),
+            11 => Msg::DisplayReady(Ok(decode_mode(rest)?)),
             12 => Msg::DisplayReady(Err(String::from_utf8_lossy(rest).into_owned())),
             13 => Msg::Paused(*rest.first().context("no paused flag")? != 0),
-            14 => Msg::Caps { extend: *rest.first().context("no extend flag")? != 0 },
+            // `view` came later: a client that does not send it cannot be viewed.
+            14 => Msg::Caps {
+                extend: *rest.first().context("no extend flag")? != 0,
+                view: rest.get(1).is_some_and(|&b| b != 0),
+            },
+            15 => Msg::View(*rest.first().context("no view flag")? != 0),
+            16 => Msg::ViewReady(Ok(decode_mode(rest)?)),
+            17 => Msg::ViewReady(Err(String::from_utf8_lossy(rest).into_owned())),
             _ => bail!("unknown message tag {tag}"),
         })
     }
+}
+
+fn encode_mode(mode: &ScreenMode, out: &mut Vec<u8>) {
+    for n in [mode.w, mode.h, mode.hz] {
+        out.extend_from_slice(&n.to_le_bytes());
+    }
+}
+
+fn decode_mode(b: &[u8]) -> Result<ScreenMode> {
+    Ok(ScreenMode {
+        w: u32_at(b, 0)?,
+        h: u32_at(b, 4)?,
+        hz: u32_at(b, 8)?,
+    })
 }
 
 fn encode_event(event: &Event, out: &mut Vec<u8>) {
@@ -325,11 +364,38 @@ mod tests {
             Msg::Display(Show::On { workspace: 9 }),
             Msg::DisplayReady(Ok(ScreenMode { w: 1920, h: 1080, hz: 120 })),
             Msg::DisplayReady(Err("install gst-plugin-va".into())),
-            Msg::Input(Event::Pointer(PointerEvent::Motion { time: 7, dx: -1.5, dy: 2.25 })),
-            Msg::Input(Event::Pointer(PointerEvent::Button { time: 8, button: 0x110, state: 1 })),
-            Msg::Input(Event::Pointer(PointerEvent::Axis { time: 9, axis: 1, value: -3.5 })),
-            Msg::Input(Event::Pointer(PointerEvent::AxisDiscrete120 { axis: 0, value: -120 })),
-            Msg::Input(Event::Keyboard(KeyboardEvent::Key { time: 10, key: 30, state: 1 })),
+            Msg::View(true),
+            Msg::View(false),
+            Msg::ViewReady(Ok(ScreenMode {
+                w: 1920,
+                h: 1080,
+                hz: 60,
+            })),
+            Msg::ViewReady(Err("install gst-plugins-good".into())),
+            Msg::Input(Event::Pointer(PointerEvent::Motion {
+                time: 7,
+                dx: -1.5,
+                dy: 2.25,
+            })),
+            Msg::Input(Event::Pointer(PointerEvent::Button {
+                time: 8,
+                button: 0x110,
+                state: 1,
+            })),
+            Msg::Input(Event::Pointer(PointerEvent::Axis {
+                time: 9,
+                axis: 1,
+                value: -3.5,
+            })),
+            Msg::Input(Event::Pointer(PointerEvent::AxisDiscrete120 {
+                axis: 0,
+                value: -120,
+            })),
+            Msg::Input(Event::Keyboard(KeyboardEvent::Key {
+                time: 10,
+                key: 30,
+                state: 1,
+            })),
             Msg::Input(Event::Keyboard(KeyboardEvent::Modifiers {
                 depressed: 4,
                 latched: 0,
@@ -352,7 +418,12 @@ mod tests {
         assert_eq!(Msg::Enter.route(), Route::Stream);
         assert_eq!(Msg::Arrange(Side::Left).route(), Route::Stream);
         // Must arrive, and tiny: the video itself has a connection of its own.
-        assert_eq!(Msg::Display(Show::On { workspace: 9 }).route(), Route::Stream);
+        assert_eq!(
+            Msg::Display(Show::On { workspace: 9 }).route(),
+            Route::Stream
+        );
+        assert_eq!(Msg::View(true).route(), Route::Stream);
+        assert_eq!(Msg::ViewReady(Err(String::new())).route(), Route::Stream);
         // Both kinds of clipboard, because text can be a megabyte too.
         assert_eq!(Msg::Clipboard(Clip::Text(String::new())).route(), Route::Bulk);
         let image = Clip::Image { mime: "image/png".into(), bytes: vec![0; 8] };
@@ -380,9 +451,21 @@ mod tests {
 
     #[test]
     fn caps_cross_intact() {
-        for extend in [true, false] {
-            let msg = Msg::Caps { extend };
+        for (extend, view) in [(true, false), (false, true), (true, true)] {
+            let msg = Msg::Caps { extend, view };
             assert_eq!(Msg::decode(&msg.encode()).unwrap(), msg);
         }
+        // What a client from before View Screen sends.
+        assert_eq!(
+            Msg::decode(&[14, 1]).unwrap(),
+            Msg::Caps {
+                extend: true,
+                view: false
+            }
+        );
+        assert!(
+            Msg::decode(&[15]).is_err(),
+            "no view flag is refused, not guessed"
+        );
     }
 }

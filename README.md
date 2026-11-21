@@ -90,9 +90,12 @@ working over ssh. Pair as many machines as you like.
 
 The Mac's menu lists every device. Each device's submenu turns it **On** or
 **Off**: Off closes the connection, so nothing reaches it. The submenu also
-makes the device the **extended display** (Hyprland only), or **forgets** it.
-From a terminal, use `glide ctl peer on|off|forget <name>` and
-`glide ctl extend <name>|off`.
+makes the device the **extended display** (Hyprland only), shows its screen
+and sound fullscreen on the Mac with **View Screen** (the Mac's keyboard and
+mouse drive it until Ctrl+Option+Cmd brings them home, which also ends the
+view), or **forgets** it. From a terminal, use
+`glide ctl peer on|off|forget <name>`, `glide ctl extend <name>|off` and
+`glide ctl view <name>|off`.
 
 <details><summary>Pairing by hand instead</summary>
 

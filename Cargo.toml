@@ -40,6 +40,10 @@ wl-clipboard-rs = "0.9"
 # Wayland surface, no copies through this process.
 gstreamer = "0.25"
 gstreamer-app = "0.25"
+# View Screen's capture on Hyprland: wlr-screencopy into shared memory. Pinned
+# to what input-emulation already pulls in, so nothing new is fetched.
+wayland-client = "=0.31.15"
+wayland-protocols-wlr = { version = "=0.3.12", features = ["client"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"

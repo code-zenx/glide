@@ -213,7 +213,9 @@ fn wait(call: impl FnOnce(RcBlock<dyn Fn(*mut NSError)>)) -> Result<()> {
     }
 }
 
-fn class(name: &CStr) -> Result<&'static AnyClass> {
+/// An Objective-C class by name, or why not. View Screen finds AVFoundation's
+/// layer this way too.
+pub(crate) fn class(name: &CStr) -> Result<&'static AnyClass> {
     AnyClass::get(name).with_context(|| format!("{name:?} is missing from this macOS"))
 }
 

@@ -31,24 +31,11 @@ impl Screen {
         if gst::ElementFactory::find(DECODER).is_none() {
             bail!("install gst-plugin-va");
         }
-        let monitors: Vec<serde_json::Value> = hyprctl(&["-j", "monitors"])?;
-        let monitor = monitors
-            .iter()
-            .find(|m| m["focused"].as_bool() == Some(true))
-            .or(monitors.first())
-            .context("Hyprland reports no monitor")?;
-        let mode = ScreenMode {
-            w: monitor["width"].as_u64().unwrap_or(0) as u32,
-            h: monitor["height"].as_u64().unwrap_or(0) as u32,
-            hz: monitor["refreshRate"].as_f64().unwrap_or(60.0).round() as u32,
-        };
-        if mode.w == 0 || mode.h == 0 {
-            bail!("cannot read the monitor's mode");
-        }
+        let (output, mode) = focused_monitor()?;
         let active: serde_json::Value = hyprctl(&["-j", "activeworkspace"])?;
         Ok(Self {
             mode,
-            output: monitor["name"].as_str().unwrap_or_default().to_string(),
+            output,
             workspace,
             previous: active["id"].as_i64(),
         })
@@ -65,6 +52,29 @@ impl Screen {
             dispatch(&previous.to_string());
         }
     }
+}
+
+/// The monitor Hyprland has focused, or its first: its name and mode. View
+/// Screen captures the same one Extend would show on.
+pub fn focused_monitor() -> Result<(String, ScreenMode)> {
+    let monitors: Vec<serde_json::Value> = hyprctl(&["-j", "monitors"])?;
+    let monitor = monitors
+        .iter()
+        .find(|m| m["focused"].as_bool() == Some(true))
+        .or(monitors.first())
+        .context("Hyprland reports no monitor")?;
+    let mode = ScreenMode {
+        w: monitor["width"].as_u64().unwrap_or(0) as u32,
+        h: monitor["height"].as_u64().unwrap_or(0) as u32,
+        hz: monitor["refreshRate"].as_f64().unwrap_or(60.0).round() as u32,
+    };
+    if mode.w == 0 || mode.h == 0 {
+        bail!("cannot read the monitor's mode");
+    }
+    Ok((
+        monitor["name"].as_str().unwrap_or_default().to_string(),
+        mode,
+    ))
 }
 
 fn hyprctl<T: serde::de::DeserializeOwned>(args: &[&str]) -> Result<T> {
@@ -122,8 +132,9 @@ impl Player {
 }
 
 /// GStreamer reports trouble on its bus, not through return values; without
-/// this a decoder that refuses the stream fails in silence.
-fn watch(pipeline: &gst::Pipeline) {
+/// this a decoder that refuses the stream fails in silence. View Screen's
+/// encoders report the same way.
+pub fn watch(pipeline: &gst::Pipeline) {
     let Some(bus) = pipeline.bus() else { return };
     std::thread::spawn(move || {
         for msg in bus.iter_timed(gst::ClockTime::NONE) {

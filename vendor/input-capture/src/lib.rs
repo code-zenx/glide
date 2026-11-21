@@ -210,6 +210,16 @@ impl InputCapture {
         self.capture.restrict_to_display(index).await;
     }
 
+    /// glide: start capturing for `id` now, as if the cursor had just crossed
+    /// its edge, leaving the cursor where it is. False when that edge is not
+    /// armed, or the backend cannot start a capture by itself.
+    pub async fn begin(&mut self, id: CaptureHandle) -> Result<bool, CaptureError> {
+        match self.id_map.get(&id) {
+            Some(&pos) => self.capture.begin(pos).await,
+            None => Ok(false),
+        }
+    }
+
     /// check whether the given keys are pressed
     pub fn keys_pressed(&self, keys: &[scancode::Linux]) -> bool {
         keys.iter().all(|k| self.pressed_keys.contains(k))
@@ -291,6 +301,10 @@ trait Capture: Stream<Item = Result<(Position, CaptureEvent), CaptureError>> + U
     /// them, where the backend can express that. Backends that cannot simply
     /// ignore it.
     async fn restrict_to_display(&mut self, index: Option<usize>);
+
+    /// glide: grab input through the barrier at `pos` without the cursor
+    /// crossing it. Only macOS can; the others say no.
+    async fn begin(&mut self, pos: Position) -> Result<bool, CaptureError>;
 
     /// create a new client with the given id
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError>;

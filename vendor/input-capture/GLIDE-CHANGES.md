@@ -1,6 +1,6 @@
 # What glide changed in this crate
 
-Vendored from `input-capture` 0.4.0 (GPL-3.0, from lan-mouse). Three changes:
+Vendored from `input-capture` 0.4.0 (GPL-3.0, from lan-mouse). Five changes:
 
 ## A capture barrier can belong to a single display
 
@@ -61,6 +61,18 @@ It fires on key up, so whichever machine has the keyboard sees each modifier
 released, and Shift pressed with the chord cancels it. Nothing armed, nothing
 happens. `ProducerEvent::Release` also clears `modifier_state`,
 which went stale when keys were let go after a release.
+
+## Capture can begin on request
+
+View Screen hands the keyboard and mouse to a device the moment its screen
+goes fullscreen, without the cursor going anywhere. `InputCapture::begin(id)`
+does what the toggle chord does, for the barrier keyed to that handle: the
+cursor is held where it is (`hold_cursor` in `macos.rs`, now shared with the
+chord) and `ProducerEvent::Grab` goes through the same queue as `release`, so
+a release asked for just before lands first. It returns `false` when that
+handle has no armed barrier. `Capture::begin` is on the trait; every backend
+but macOS answers `Ok(false)`. No `CaptureEvent::Begin` is sent: the caller
+already knows it began.
 
 ## X11 watches an edge instead of capturing
 

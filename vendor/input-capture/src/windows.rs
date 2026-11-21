@@ -21,6 +21,9 @@ pub struct WindowsInputCapture {
 impl Capture for WindowsInputCapture {
     /// glide: this backend has no per-display barrier; the setting is ignored.
     async fn restrict_to_display(&mut self, _index: Option<usize>) {}
+    async fn begin(&mut self, _pos: Position) -> Result<bool, CaptureError> {
+        Ok(false)
+    }
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         self.event_thread.create(pos);
         Ok(())
