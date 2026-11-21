@@ -91,9 +91,11 @@ working over ssh. Pair as many machines as you like.
 The Mac's menu lists every device. Each device's submenu turns it **On** or
 **Off**: Off closes the connection, so nothing reaches it. The submenu also
 makes the device the **extended display** (Hyprland only), shows its screen
-and sound fullscreen on the Mac with **View Screen** (the Mac's keyboard and
-mouse drive it until Ctrl+Option+Cmd brings them home, which also ends the
-view), or **forgets** it. From a terminal, use
+and sound in a fullscreen window of its own on the Mac with **View Screen**, or
+**forgets** it. Click the picture and the Mac's keyboard and mouse drive the
+device; leave the window (Cmd+Tab, swipe to another Space, another app) and
+they are the Mac's again while the picture keeps playing. The view ends when
+you close its window or untick View Screen. From a terminal, use
 `glide ctl peer on|off|forget <name>`, `glide ctl extend <name>|off` and
 `glide ctl view <name>|off`.
 

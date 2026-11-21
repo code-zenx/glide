@@ -239,7 +239,8 @@ enum Dot {
 fn describe(state: &State, peer: &PeerState) -> (Dot, String) {
     let extended = state.extending == peer.name && !state.display.is_empty() && !state.display.starts_with('⚠');
     match state.mode_of(peer).as_str() {
-        "sending" if state.viewing == peer.name => (Dot::Controlling, "viewing".into()),
+        // Viewed: input reaches it only while the user is in its window.
+        "local" | "sending" if state.viewing == peer.name => (Dot::Controlling, "viewing".into()),
         "sending" => (Dot::Controlling, "controlling".into()),
         "off" => (Dot::Off, "off".into()),
         "local" if peer.paused => (Dot::Paused, format!("paused on {}", peer.name)),
@@ -570,6 +571,13 @@ mod tests {
         s.extending = "anorak".into();
         s.display = "Extended: 2560×1440 at 60 Hz".into();
         assert_eq!(describe(&s, &p), (Dot::Extended, "extended display".into()));
+        s.viewing = "anorak".into();
+        assert_eq!(
+            describe(&s, &p),
+            (Dot::Controlling, "viewing".into()),
+            "a view says so with input at home"
+        );
+        s.viewing.clear();
         s.flow = "sending".into();
         s.active = "anorak".into();
         assert_eq!(

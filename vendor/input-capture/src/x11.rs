@@ -87,9 +87,6 @@ fn edge_at(x: i32, y: i32, w: i32, h: i32, edges: &[Position]) -> Option<Positio
 impl Capture for X11InputCapture {
     /// glide: this backend has no per-display barrier; the setting is ignored.
     async fn restrict_to_display(&mut self, _index: Option<usize>) {}
-    async fn begin(&mut self, _pos: Position) -> Result<bool, CaptureError> {
-        Ok(false)
-    }
 
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         if !self.edges.contains(&pos) {

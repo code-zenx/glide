@@ -618,9 +618,6 @@ impl Inner {
 impl Capture for LayerShellInputCapture {
     /// glide: this backend has no per-display barrier; the setting is ignored.
     async fn restrict_to_display(&mut self, _index: Option<usize>) {}
-    async fn begin(&mut self, _pos: Position) -> Result<bool, CaptureError> {
-        Ok(false)
-    }
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {
         self.add_client(pos);
         let inner = self.0.get_mut();

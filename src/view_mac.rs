@@ -1,8 +1,9 @@
-//! The Mac end of View Screen: the device's streams, shown in a borderless
-//! window over the whole screen the cursor is on and played through the
-//! speakers. The window's view is backed by an `AVSampleBufferDisplayLayer`,
-//! which decodes H.264 on the media engine and draws it with no copies
-//! through this process.
+//! The Mac end of View Screen: the device's streams, shown in a window that
+//! goes fullscreen in a Space of its own and played through the speakers. The
+//! window's view is backed by an `AVSampleBufferDisplayLayer`, which decodes
+//! H.264 on the media engine and draws it with no copies through this
+//! process. What the window does with the keyboard and mouse is
+//! `view_input_mac.rs`.
 //!
 //! AVFoundation's classes are reached by name through the Objective-C
 //! runtime, the way `display_mac.rs` reaches `CGVirtualDisplay`, so no new
@@ -19,7 +20,10 @@ use dispatch2::DispatchQueue;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{msg_send, MainThreadOnly};
-use objc2_app_kit::{NSBackingStoreType, NSColor, NSEvent, NSScreen, NSWindow, NSWindowStyleMask};
+use objc2_app_kit::{
+    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSColor, NSEvent, NSScreen, NSWindow,
+    NSWindowCollectionBehavior, NSWindowStyleMask,
+};
 use objc2_core_foundation::{CFRetained, CFString};
 use objc2_core_media::{
     kCMBlockBufferAssureMemoryNowFlag, kCMSampleAttachmentKey_DisplayImmediately, CMBlockBuffer,
@@ -28,6 +32,8 @@ use objc2_core_media::{
 use objc2_foundation::{MainThreadMarker, NSString};
 use quinn::RecvStream;
 use tokio::sync::mpsc::UnboundedSender;
+
+use crate::view_input_mac::{Device, Input};
 
 // Also what keeps AVFoundation linked, so its classes exist to be named.
 #[link(name = "AVFoundation", kind = "framework")]
@@ -42,9 +48,6 @@ unsafe extern "C" {
     static kCFBooleanTrue: *const c_void;
 }
 
-/// NSMainMenuWindowLevel + 1: over the menu bar and the Dock, so the picture
-/// fills the screen without the Space switch real fullscreen makes.
-const ABOVE_MENU_BAR: isize = 25;
 /// AVQueuedSampleBufferRenderingStatusFailed.
 const FAILED: isize = 2;
 /// The app's main thread answers at once. Without the app (`glide run`)
@@ -52,8 +55,9 @@ const FAILED: isize = 2;
 const MAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 thread_local! {
-    /// The open window. Only the main thread may touch it, so it lives there.
-    static WINDOW: RefCell<Option<Retained<NSWindow>>> = const { RefCell::new(None) };
+    /// The open window and its input. Only the main thread may touch them, so
+    /// they live there.
+    static WINDOW: RefCell<Option<(Retained<NSWindow>, Input)>> = const { RefCell::new(None) };
 }
 
 /// The display layer. AVSampleBufferDisplayLayer takes frames on any thread;
@@ -76,12 +80,12 @@ unsafe impl Send for Screen {}
 
 impl Screen {
     /// Open the window on the main thread and wait for it.
-    pub fn open() -> Result<Self> {
+    pub fn open(device: Device) -> Result<Self> {
         let (tx, rx) = mpsc::channel();
         DispatchQueue::main().exec_async(move || {
             let made = MainThreadMarker::new()
                 .context("not the main thread")
-                .and_then(open_window);
+                .and_then(|mtm| open_window(mtm, device));
             let _ = tx.send(made.map_err(|e| e.to_string()));
         });
         let layer = rx
@@ -129,14 +133,16 @@ impl Drop for Screen {
     }
 }
 
-/// Show one device until it stops or fails. A failure says why, and hands
-/// input home through the session like any other way of stopping.
+/// Show one device until it stops or fails. A failure says why, and ends the
+/// view through the session like any other way of stopping.
 pub async fn follow(
     net: crate::link::Net,
+    links: std::sync::Arc<crate::link::Links>,
     peer: crate::Peer,
     control: UnboundedSender<crate::input::Control>,
 ) {
-    if let Err(e) = receive(&net, &peer).await {
+    let device = Device { peer: peer.name.clone(), links, control: control.clone() };
+    if let Err(e) = receive(&net, &peer, device).await {
         tracing::warn!(peer = %peer.name, "view ended: {e:#}");
         crate::pair::notify(
             &format!("Glide stopped viewing {}", peer.name),
@@ -146,10 +152,10 @@ pub async fn follow(
     }
 }
 
-async fn receive(net: &crate::link::Net, peer: &crate::Peer) -> Result<()> {
+async fn receive(net: &crate::link::Net, peer: &crate::Peer, device: Device) -> Result<()> {
     let conn = net.dial_view(peer).await?;
     let (mut video, sound) = crate::view::accept_streams(&conn).await?;
-    let mut screen = Screen::open()?;
+    let mut screen = Screen::open(device)?;
     let playing = tokio::spawn(play(sound));
     let shown = crate::display::recv_frames(&mut video, |frame| {
         if let Err(e) = screen.show(&frame.data) {
@@ -173,23 +179,30 @@ async fn play(mut recv: RecvStream) {
     }
 }
 
-fn open_window(mtm: MainThreadMarker) -> Result<Layer> {
+fn open_window(mtm: MainThreadMarker, device: Device) -> Result<Layer> {
     close_window();
     let frame = screen_under_cursor(mtm)
         .context("no screen to show it on")?
-        .frame();
+        .visibleFrame();
+    let style = NSWindowStyleMask::Titled
+        | NSWindowStyleMask::Closable
+        | NSWindowStyleMask::Miniaturizable
+        | NSWindowStyleMask::Resizable;
     let window = unsafe {
         NSWindow::initWithContentRect_styleMask_backing_defer(
             NSWindow::alloc(mtm),
             frame,
-            NSWindowStyleMask::Borderless,
+            style,
             NSBackingStoreType::Buffered,
             false,
         )
     };
     unsafe { window.setReleasedWhenClosed(false) };
-    window.setLevel(ABOVE_MENU_BAR);
+    window.setTitle(&NSString::from_str(&format!("{} — Glide", device.peer)));
     window.setBackgroundColor(Some(&NSColor::blackColor()));
+    // Fullscreen in a Space of its own, so swiping, Mission Control and
+    // Cmd+Tab can leave it and come back.
+    window.setCollectionBehavior(NSWindowCollectionBehavior::FullScreenPrimary);
     let view = window.contentView().context("the window has no view")?;
     let layer: Retained<AnyObject> = unsafe {
         msg_send![
@@ -204,17 +217,39 @@ fn open_window(mtm: MainThreadMarker) -> Result<Layer> {
         let _: () = msg_send![&*view, setLayer: &*layer];
     }
     view.setWantsLayer(true);
-    // An accessory app is never active, so it has to be told to come forward.
-    window.orderFrontRegardless();
-    WINDOW.with(|w| *w.borrow_mut() = Some(window));
+    let input = Input::attach(&window, device)?;
+    // A menu-bar app has no Dock icon and no place in Cmd+Tab, and a view
+    // needs both to be come back to.
+    let app = NSApplication::sharedApplication(mtm);
+    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+    app.activate();
+    window.makeKeyAndOrderFront(None);
+    WINDOW.with(|w| *w.borrow_mut() = Some((window, input)));
+    // On the next turn of the main loop: a window asked to go fullscreen
+    // before it is on screen may stay as it is.
+    DispatchQueue::main().exec_async(go_fullscreen);
     Ok(Layer(layer))
 }
 
+/// Into fullscreen, unless already there: a second toggle would bring it out.
+fn go_fullscreen() {
+    WINDOW.with(|w| {
+        let open = w.borrow();
+        let Some((window, _)) = open.as_ref() else { return };
+        if !window.styleMask().contains(NSWindowStyleMask::FullScreen) {
+            window.toggleFullScreen(None);
+        }
+    });
+}
+
 fn close_window() {
-    if let Some(window) = WINDOW.with(|w| w.borrow_mut().take()) {
-        window.orderOut(None);
-        window.close();
-    }
+    let Some((window, input)) = WINDOW.with(|w| w.borrow_mut().take()) else { return };
+    // Input first: its close-button watch must not take this close for the
+    // user's.
+    drop(input);
+    window.close();
+    let app = NSApplication::sharedApplication(window.mtm());
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 }
 
 /// Where the cursor is, which is where the menu was just clicked.

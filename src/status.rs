@@ -58,7 +58,7 @@ pub struct State {
     /// The device chosen to show the extended display, if any. Server only,
     /// in process, like `can_extend`.
     pub extending: String,
-    /// The device whose screen this server is showing fullscreen, if any.
+    /// The device whose screen this server is showing in a window, if any.
     /// Server only, in process, like `extending`.
     pub viewing: String,
 }

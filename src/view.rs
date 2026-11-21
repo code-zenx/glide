@@ -1,6 +1,6 @@
-//! View Screen: a Linux machine's screen and sound, fullscreen on the Mac,
-//! with the Mac's keyboard and mouse driving it — Moonlight and Sunshine,
-//! inside glide.
+//! View Screen: a Linux machine's screen and sound in a fullscreen window on
+//! the Mac, with the Mac's keyboard and mouse driving it while the user is in
+//! that window — Moonlight and Sunshine, inside glide.
 //!
 //! The Mac asks with `Msg::View(true)`; the peer answers `ViewReady` with the
 //! mode of the screen it will send. The Mac then dials a connection of its
@@ -10,9 +10,10 @@
 //! stream starts with one byte saying which it is, so neither end depends on
 //! the order the other opened them in.
 //!
-//! Who owns input is the session's business (`input.rs`): a view lasts as long
-//! as the viewed device has the keyboard and mouse, and ends when they come
-//! home.
+//! The window's own input is `view_input_mac.rs`'s business. The session
+//! (`input.rs`) decides when a view starts and ends: from the menu, `glide ctl`,
+//! the window's close button, or the device going away. Input coming home does
+//! not end it.
 
 use std::sync::Arc;
 
@@ -189,8 +190,9 @@ impl Watching {
             Step::Start(mode) => {
                 info!(peer = %name, w = mode.w, h = mode.h, hz = mode.hz, "viewing");
                 if let Some(peer) = self.peer.clone() {
+                    let links = self.links.clone();
                     let follow =
-                        crate::view_mac::follow(self.net.clone(), peer, self.control.clone());
+                        crate::view_mac::follow(self.net.clone(), links, peer, self.control.clone());
                     self.task = Some(tokio::spawn(follow));
                 }
             }
@@ -231,7 +233,7 @@ pub async fn share(links: Arc<Links>, mut events: UnboundedReceiver<Event>) {
                 // The old one goes first: it may hold the headless monitor
                 // and the null sink the new one is about to make.
                 sharing = None;
-                screen = None;
+                drop(screen.take());
                 let prepared = tokio::task::spawn_blocking(Screen::prepare)
                     .await
                     .unwrap_or_else(|e| Err(e.into()));

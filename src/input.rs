@@ -229,7 +229,8 @@ pub enum Control {
     RetryBackends,
     /// Show the extended display on this device, or on none.
     Extend(Option<String>),
-    /// Show this device's screen fullscreen here and drive it, or stop.
+    /// Show this device's screen in a window here, or stop. Input reaches it
+    /// through that window only while the user is in it (`view_input_mac.rs`).
     View(Option<String>),
     /// Switch one peer off (or back on). Off: the link is closed and the
     /// peer told why; nothing crosses until it is switched on again.
@@ -286,35 +287,22 @@ async fn hand_back(capture: &mut Option<InputCapture>, links: &Links, peer: &str
     release(capture.as_mut()).await
 }
 
-/// Take the cursor and start feeding `peer`, as crossing its edge does.
-fn enter(handover: &mut Handover, links: &Arc<Links>, handle: CaptureHandle, peer: &str) {
-    handover.began(handle);
-    links.send(peer, Msg::Enter);
-    push_clipboard(links, peer);
-}
-
-/// Hand `peer` the keyboard and mouse without the cursor crossing its edge,
-/// the way the toggle chord does. False when the capture cannot: no
-/// permission, or its edge is not armed (switched off, paused, extended).
-async fn begin_view(
-    capture: &mut Option<InputCapture>,
-    links: &Arc<Links>,
-    handover: &mut Handover,
-    (handle, peer): (CaptureHandle, &str),
-) -> Result<bool> {
-    let Some(capture) = capture.as_mut() else {
-        return Ok(false);
-    };
-    if !capture.begin(handle).await? {
-        return Ok(false);
-    }
-    enter(handover, links, handle, peer);
-    Ok(true)
-}
-
 /// The handle of a device that has not been forgotten.
 fn live(names: &[String], gone: &[bool], name: &str) -> Option<usize> {
     names.iter().enumerate().position(|(i, n)| n == name && !gone[i])
+}
+
+/// Arm or drop every device's edge to match `wanted`, after the extended or
+/// viewed device changed.
+async fn sync_edges(capture: &mut InputCapture, peers: &[Peer], armed: &mut [bool], wanted: impl Fn(usize) -> bool) -> Result<()> {
+    for (i, peer) in peers.iter().enumerate() {
+        let want = wanted(i);
+        if want != armed[i] {
+            armed[i] = want;
+            set_edge(capture, i, peer, want).await?;
+        }
+    }
+    Ok(())
 }
 
 async fn set_edge(capture: &mut InputCapture, handle: usize, peer: &Peer, on: bool) -> Result<()> {
@@ -368,7 +356,8 @@ pub async fn session(
     } else {
         None
     };
-    // The device whose screen is shown here. Server only.
+    // The device whose screen is shown here. Server only. Its edge stays
+    // disarmed meanwhile, like an extended device's.
     let mut viewing: Option<usize> = None;
     for i in 0..config.peers.len() {
         if let Some(emulation) = emulation.as_mut() {
@@ -399,12 +388,11 @@ pub async fn session(
         s.denied = degraded;
     });
     loop {
-        // A view lasts exactly as long as its device has the keyboard and
-        // mouse: whatever brings them home (the chord, a release, a dead link,
-        // a failed view) ends it too. Checked here because most arms below
-        // `continue`.
-        if let Some(i) = viewing.filter(|&i| handover.sending() != Some(i as CaptureHandle)) {
-            info!(peer = %names[i], "input is home, view stopped");
+        // A view outlives input coming home, but not its device: unlinked,
+        // switched off, forgotten (which switches it off) or made the extended
+        // display. Checked here because most arms below `continue`.
+        if let Some(i) = viewing.filter(|&i| !linked[i] || !enabled[i] || extend == Some(i)) {
+            info!(peer = %names[i], "device unavailable, view stopped");
             viewing = None;
             status.set(|s| s.viewing.clear());
             let _ = view.send(view::Event::Target(None));
@@ -432,7 +420,9 @@ pub async fn session(
                             }
                             Crossing::Send => {
                                 info!(%peer, "cursor left this screen; {RELEASE_HINT} takes it back");
-                                enter(&mut handover, &links, handle, peer);
+                                handover.began(handle);
+                                links.send(peer, Msg::Enter);
+                                push_clipboard(&links, peer);
                             }
                         },
                         CaptureEvent::Input(event) => {
@@ -487,7 +477,7 @@ pub async fn session(
                     held_off[handle] = false;
                 }
                 let Some(capture) = capture.as_mut() else { continue };
-                let want = edge_wanted(up, extend == Some(handle), enabled[handle] && !held_off[handle]);
+                let want = edge_wanted(up, extend == Some(handle) || viewing == Some(handle), enabled[handle] && !held_off[handle]);
                 if want == armed[handle] {
                     continue;
                 }
@@ -524,13 +514,8 @@ pub async fn session(
                         release(capture.as_mut()).await?;
                     }
                     if let Some(capture) = capture.as_mut() {
-                        for (i, peer) in config.peers.iter().enumerate() {
-                            let want = !gone[i] && edge_wanted(linked[i], extend == Some(i), enabled[i] && !held_off[i]);
-                            if want != armed[i] {
-                                armed[i] = want;
-                                set_edge(capture, i, peer, want).await?;
-                            }
-                        }
+                        let wanted = |i: usize| !gone[i] && edge_wanted(linked[i], extend == Some(i) || viewing == Some(i), enabled[i] && !held_off[i]);
+                        sync_edges(capture, &config.peers, &mut armed, wanted).await?;
                     }
                     publish(&names, &handover, degraded, &mut shown);
                     continue;
@@ -550,22 +535,20 @@ pub async fn session(
                     if target == viewing {
                         continue;
                     }
-                    // Input comes home first; the check at the top of the loop
-                    // then ends the old view, if this starts no new one.
-                    if let Some(handle) = handover.sending() {
+                    // Its edge is about to go: input it holds comes home first.
+                    if let Some(handle) = handover.sending().filter(|&h| Some(h as usize) == target) {
                         hand_back(&mut capture, &links, &names[handle as usize].clone(), &mut handover).await?;
                     }
-                    if let Some(i) = target {
-                        if begin_view(&mut capture, &links, &mut handover, (i as CaptureHandle, &names[i])).await? {
-                            info!(peer = %names[i], "viewing its screen; {RELEASE_HINT} stops");
-                            viewing = Some(i);
-                            status.set(|s| s.viewing = names[i].clone());
-                            let _ = view.send(view::Event::Target(Some(config.peers[i].clone())));
-                        } else {
-                            warn!(peer = %names[i], "cannot hand it the keyboard and mouse, so not viewing it");
-                            let why = "Glide needs input permission, and the device must not be paused.";
-                            crate::pair::notify(&format!("Glide cannot view {}", names[i]), why);
-                        }
+                    viewing = target;
+                    let name = target.map(|i| names[i].clone());
+                    info!(device = ?name, "viewing a screen");
+                    status.set(|s| s.viewing = name.clone().unwrap_or_default());
+                    let _ = view.send(view::Event::Target(target.map(|i| config.peers[i].clone())));
+                    // The viewed device takes input through its window only,
+                    // so its edge goes, and the previous one's comes back.
+                    if let Some(capture) = capture.as_mut() {
+                        let wanted = |i: usize| !gone[i] && edge_wanted(linked[i], extend == Some(i) || viewing == Some(i), enabled[i] && !held_off[i]);
+                        sync_edges(capture, &config.peers, &mut armed, wanted).await?;
                     }
                     publish(&names, &handover, degraded, &mut shown);
                     continue;
@@ -678,7 +661,7 @@ pub async fn session(
                         if let Err(e) = crate::set_enabled(&config_path, &peer, on) {
                             warn!(%peer, "cannot save the switch: {e}");
                         }
-                        let want = edge_wanted(linked[i], extend == Some(i), on && !held_off[i]);
+                        let want = edge_wanted(linked[i], extend == Some(i) || viewing == Some(i), on && !held_off[i]);
                         if let Some(capture) = capture.as_mut().filter(|_| want != armed[i]) {
                             armed[i] = want;
                             set_edge(capture, i, &config.peers[i], want).await?;
@@ -811,7 +794,7 @@ pub async fn session(
                             }
                             held_off[i] = paused;
                             status.set_peer(&peer, |p| p.paused = paused);
-                            let want = edge_wanted(linked[i], extend == Some(i), enabled[i] && !paused);
+                            let want = edge_wanted(linked[i], extend == Some(i) || viewing == Some(i), enabled[i] && !paused);
                             if let Some(capture) = capture.as_mut().filter(|_| want != armed[i]) {
                                 armed[i] = want;
                                 set_edge(capture, i, &config.peers[i], want).await?;

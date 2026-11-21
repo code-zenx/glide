@@ -158,14 +158,6 @@ impl InputCaptureState {
             .find(|p| self.active_clients.contains(p))
     }
 
-    /// glide: capture from where the cursor is now instead of from an edge.
-    /// The toggle chord and `begin` both come in this way.
-    fn hold_cursor(&mut self) -> bool {
-        let Some(here) = cursor_location() else { return false };
-        self.enter_position = Some(here);
-        true
-    }
-
     /// start the input capture by
     fn start_capture(&mut self, event: &CGEvent, position: Position) -> Result<(), CaptureError> {
         let mut location = event.location();
@@ -294,6 +286,12 @@ fn cursor_location() -> Option<CGPoint> {
     Some(CGEvent::new(source).ok()?.location())
 }
 
+/// glide: the Linux key code for a macOS virtual key code. View Screen's
+/// window reads keys from AppKit instead of this tap and maps them the same way.
+pub fn linux_key(mac: u16) -> Option<u32> {
+    KeyMap::from_key_mapping(KeyMapping::Mac(mac)).ok().map(|k| k.evdev as u32)
+}
+
 fn get_events(
     ev_type: &CGEventType,
     ev: &CGEvent,
@@ -310,10 +308,7 @@ fn get_events(
 
     fn map_key(ev: &CGEvent) -> Result<u32, CaptureError> {
         let code = ev.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
-        match KeyMap::from_key_mapping(KeyMapping::Mac(code as u16)) {
-            Ok(k) => Ok(k.evdev as u32),
-            Err(()) => Err(CaptureError::KeyMapError(code)),
-        }
+        linux_key(code as u16).ok_or(CaptureError::KeyMapError(code))
     }
 
     match ev_type {
@@ -610,8 +605,8 @@ fn create_event_tap<'a>(
         } else if toggled {
             // glide: the cursor stays put and comes back where it was. Nothing
             // armed (no link, paused, extending) means there is nowhere to go.
-            let armed = state.send_position();
-            if let Some(new_pos) = armed.filter(|_| state.hold_cursor()) {
+            if let (Some(new_pos), Some(here)) = (state.send_position(), cursor_location()) {
+                state.enter_position = Some(here);
                 if let Err(e) = notify_tx.try_send(ProducerEvent::Grab(new_pos)) {
                     log::error!("cannot hide the cursor: {e}");
                 }
@@ -888,19 +883,6 @@ impl Capture for MacOSInputCapture {
     /// glide: confine the barriers to one display.
     async fn restrict_to_display(&mut self, index: Option<usize>) {
         self.state.lock().await.set_only_display(index);
-    }
-
-    /// glide: what the toggle chord does, on request. Sent through the same
-    /// queue as `release`, so a release asked for just before lands first.
-    async fn begin(&mut self, pos: Position) -> Result<bool, CaptureError> {
-        if !self.state.lock().await.hold_cursor() {
-            return Ok(false);
-        }
-        let notify_tx = self.notify_tx.clone();
-        tokio::task::spawn_local(async move {
-            let _ = notify_tx.send(ProducerEvent::Grab(pos)).await;
-        });
-        Ok(true)
     }
 
     async fn create(&mut self, pos: Position) -> Result<(), CaptureError> {

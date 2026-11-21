@@ -22,6 +22,8 @@ mod proto;
 mod screens;
 mod status;
 mod view;
+#[cfg(target_os = "macos")]
+mod view_input_mac;
 #[cfg(not(target_os = "macos"))]
 mod view_linux;
 #[cfg(target_os = "macos")]

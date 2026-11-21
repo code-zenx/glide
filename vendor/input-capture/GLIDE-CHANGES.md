@@ -62,18 +62,6 @@ released, and Shift pressed with the chord cancels it. Nothing armed, nothing
 happens. `ProducerEvent::Release` also clears `modifier_state`,
 which went stale when keys were let go after a release.
 
-## Capture can begin on request
-
-View Screen hands the keyboard and mouse to a device the moment its screen
-goes fullscreen, without the cursor going anywhere. `InputCapture::begin(id)`
-does what the toggle chord does, for the barrier keyed to that handle: the
-cursor is held where it is (`hold_cursor` in `macos.rs`, now shared with the
-chord) and `ProducerEvent::Grab` goes through the same queue as `release`, so
-a release asked for just before lands first. It returns `false` when that
-handle has no armed barrier. `Capture::begin` is on the trait; every backend
-but macOS answers `Ok(false)`. No `CaptureEvent::Begin` is sent: the caller
-already knows it began.
-
 ## X11 watches an edge instead of capturing
 
 Upstream's X11 backend was a stub that refused to start. A glide client only
@@ -89,3 +77,10 @@ an X11 server. Added for `nullbyte` (Kali, Xfce).
 InputCapture portal, and the libei backend's portal request is never answered
 there, so without a limit the first backend hung glide's input session forever
 on anorak (no input, no `Caps`). Now it falls through to layer-shell.
+
+## The macOS key map is public
+
+`linux_key(mac)` (re-exported from `lib.rs`, macOS only) is the tap's own
+macOS→Linux key-code lookup, which `map_key` now calls. View Screen's window
+reads keys from AppKit rather than through the tap, and uses it so both paths
+type the same keys on the device.
