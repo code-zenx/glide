@@ -340,6 +340,9 @@ async fn create_backend(
     }
 }
 
+/// glide: how long one backend may take to start before the next is tried.
+const BACKEND_PATIENCE: std::time::Duration = std::time::Duration::from_secs(5);
+
 async fn create(
     backend: Option<Backend>,
 ) -> Result<
@@ -366,7 +369,13 @@ async fn create(
         #[cfg(target_os = "macos")]
         Backend::MacOs,
     ] {
-        match create_backend(backend).await {
+        // glide: a portal that never answers (Hyprland has no InputCapture
+        // portal) would hang startup for good; move on to the next backend.
+        let Ok(created) = tokio::time::timeout(BACKEND_PATIENCE, create_backend(backend)).await else {
+            log::warn!("{backend} input capture backend did not answer, trying the next one");
+            continue;
+        };
+        match created {
             Ok(b) => {
                 log::info!("using capture backend: {backend}");
                 return Ok(b);

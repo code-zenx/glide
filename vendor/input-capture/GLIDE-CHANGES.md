@@ -1,6 +1,6 @@
 # What glide changed in this crate
 
-Vendored from `input-capture` 0.4.0 (GPL-3.0, from lan-mouse). Five changes:
+Vendored from `input-capture` 0.4.0 (GPL-3.0, from lan-mouse). Six changes:
 
 ## A capture barrier can belong to a single display
 
@@ -82,3 +82,10 @@ so `x11.rs` polls `XQueryPointer` at 100 Hz and reports `Begin` once per arrival
 at an armed edge of the root window. `release()` steps the cursor 2 px back off
 that edge so the next push counts again. It grabs nothing, so it is no use on
 an X11 server. Added for `nullbyte` (Kali, Xfce).
+
+## Backend start-up time limit (2026-11-22)
+
+`create()` gives each backend `BACKEND_PATIENCE` (5 s) to start. Hyprland has no
+InputCapture portal, and the libei backend's portal request is never answered
+there, so without a limit the first backend hung glide's input session forever
+on anorak (no input, no `Caps`). Now it falls through to layer-shell.
