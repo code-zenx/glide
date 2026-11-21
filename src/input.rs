@@ -267,6 +267,13 @@ fn pause_takes_back(sending: Option<CaptureHandle>, handle: CaptureHandle, on: b
     !on && sending == Some(handle)
 }
 
+/// Only one device is on at a time: switching one on switches every other
+/// live, switched-on device off first. Returns (device, on) in the order to apply.
+fn switches(enabled: &[bool], gone: &[bool], device: usize, on: bool) -> Vec<(usize, bool)> {
+    let others = (0..enabled.len()).filter(|&j| on && j != device && enabled[j] && !gone[j]);
+    others.map(|j| (j, false)).chain([(device, on)]).collect()
+}
+
 /// Bring input home from `peer`: the peer saw these keys go down but will
 /// never see them come up, so say so before saying goodbye.
 async fn hand_back(capture: &mut Option<InputCapture>, links: &Links, peer: &str, handover: &mut Handover) -> Result<()> {
@@ -648,33 +655,36 @@ pub async fn session(
                     continue;
                 }
                 if let Control::SetEnabled(peer, on) = asked {
-                    let Some(i) = live(&names, &gone, &peer).filter(|_| server) else { continue };
-                    let handle = i as CaptureHandle;
-                    if pause_takes_back(handover.sending(), handle, on) {
-                        info!(%peer, "switched off while it had the cursor, taking input back");
-                        hand_back(&mut capture, &links, &peer, &mut handover).await?;
+                    let Some(device) = live(&names, &gone, &peer).filter(|_| server) else { continue };
+                    for (i, on) in switches(&enabled, &gone, device, on) {
+                        let peer = names[i].clone();
+                        let handle = i as CaptureHandle;
+                        if pause_takes_back(handover.sending(), handle, on) {
+                            info!(%peer, "switched off while it had the cursor, taking input back");
+                            hand_back(&mut capture, &links, &peer, &mut handover).await?;
+                        }
+                        enabled[i] = on;
+                        config.peers[i].enabled = on;
+                        links.set_off(&peer, !on);
+                        if on {
+                            // The dialer picks it up within a couple of seconds.
+                            status.set_peer(&peer, |p| p.mode = "offline".into());
+                        } else {
+                            // Closing the link drops its edge and pauses an
+                            // extended display, which resumes when it is back.
+                            links.disconnect(&peer, crate::link::OFF);
+                            status.set_peer(&peer, |p| p.mode = "off".into());
+                        }
+                        if let Err(e) = crate::set_enabled(&config_path, &peer, on) {
+                            warn!(%peer, "cannot save the switch: {e}");
+                        }
+                        let want = edge_wanted(linked[i], extend == Some(i), on && !held_off[i]);
+                        if let Some(capture) = capture.as_mut().filter(|_| want != armed[i]) {
+                            armed[i] = want;
+                            set_edge(capture, i, &config.peers[i], want).await?;
+                        }
+                        info!(%peer, on, "peer switched");
                     }
-                    enabled[i] = on;
-                    config.peers[i].enabled = on;
-                    links.set_off(&peer, !on);
-                    if on {
-                        // The dialer picks it up within a couple of seconds.
-                        status.set_peer(&peer, |p| p.mode = "offline".into());
-                    } else {
-                        // Closing the link drops its edge and pauses an
-                        // extended display, which resumes when it is back.
-                        links.disconnect(&peer, crate::link::OFF);
-                        status.set_peer(&peer, |p| p.mode = "off".into());
-                    }
-                    if let Err(e) = crate::set_enabled(&config_path, &peer, on) {
-                        warn!(%peer, "cannot save the switch: {e}");
-                    }
-                    let want = edge_wanted(linked[i], extend == Some(i), on && !held_off[i]);
-                    if let Some(capture) = capture.as_mut().filter(|_| want != armed[i]) {
-                        armed[i] = want;
-                        set_edge(capture, i, &config.peers[i], want).await?;
-                    }
-                    info!(%peer, on, "peer switched");
                     publish(&names, &handover, degraded, &mut shown);
                     continue;
                 }
@@ -941,6 +951,21 @@ mod tests {
         assert!(!handover.peer_entered(0));
         assert!(handover.peer_input(0));
         assert_eq!(handover.name(), "receiving");
+    }
+
+    #[test]
+    fn switching_one_device_on_switches_the_others_off() {
+        let enabled = [true, true, false, true];
+        let gone = [false, false, false, true];
+        assert_eq!(
+            switches(&enabled, &gone, 2, true),
+            vec![(0, false), (1, false), (2, true)]
+        );
+        assert_eq!(
+            switches(&enabled, &gone, 0, true),
+            vec![(1, false), (0, true)]
+        );
+        assert_eq!(switches(&enabled, &gone, 1, false), vec![(1, false)]);
     }
 
     use super::*;
