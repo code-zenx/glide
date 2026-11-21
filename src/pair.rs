@@ -216,6 +216,7 @@ async fn pair_with(token: &str, name: Option<String>, config_path: &Path, config
         position: Side::Right,
         display: None,
         enabled: true,
+        control: false,
     };
     let endpoint = crate::link::pair_endpoint(&identity, server.clone())?;
     let mut last = anyhow::anyhow!("no address answered");

@@ -235,6 +235,9 @@ pub enum Control {
     /// Switch one peer off (or back on). Off: the link is closed and the
     /// peer told why; nothing crosses until it is switched on again.
     SetEnabled(String, bool),
+    /// Let the cursor cross into one peer (or stop it). Without it a switched
+    /// on peer shares the clipboard only.
+    Drive(String, bool),
     /// A device was just paired (or re-paired under its old name).
     AddPeer(Peer),
     /// Forget a device: off for good, and out of the config.
@@ -348,6 +351,10 @@ pub async fn session(
     let mut armed = vec![false; config.peers.len()];
     let mut linked = vec![false; config.peers.len()];
     let mut enabled: Vec<bool> = config.peers.iter().map(|p| !server || p.enabled).collect();
+    let mut control_on: Vec<bool> = config.peers.iter().map(|p| !server || p.control).collect();
+    for (peer, &on) in config.peers.iter().zip(&control_on) {
+        status.set_peer(&peer.name, |p| p.control = on);
+    }
     // A client that paused itself: like switched off, but its choice, not saved here.
     let mut held_off = vec![false; config.peers.len()];
     // Only a server has a display to extend.
@@ -477,7 +484,7 @@ pub async fn session(
                     held_off[handle] = false;
                 }
                 let Some(capture) = capture.as_mut() else { continue };
-                let want = edge_wanted(up, extend == Some(handle) || viewing == Some(handle), enabled[handle] && !held_off[handle]);
+                let want = edge_wanted(up, extend == Some(handle) || viewing == Some(handle), enabled[handle] && control_on[handle] && !held_off[handle]);
                 if want == armed[handle] {
                     continue;
                 }
@@ -514,7 +521,7 @@ pub async fn session(
                         release(capture.as_mut()).await?;
                     }
                     if let Some(capture) = capture.as_mut() {
-                        let wanted = |i: usize| !gone[i] && edge_wanted(linked[i], extend == Some(i) || viewing == Some(i), enabled[i] && !held_off[i]);
+                        let wanted = |i: usize| !gone[i] && edge_wanted(linked[i], extend == Some(i) || viewing == Some(i), enabled[i] && control_on[i] && !held_off[i]);
                         sync_edges(capture, &config.peers, &mut armed, wanted).await?;
                     }
                     publish(&names, &handover, degraded, &mut shown);
@@ -547,7 +554,7 @@ pub async fn session(
                     // The viewed device takes input through its window only,
                     // so its edge goes, and the previous one's comes back.
                     if let Some(capture) = capture.as_mut() {
-                        let wanted = |i: usize| !gone[i] && edge_wanted(linked[i], extend == Some(i) || viewing == Some(i), enabled[i] && !held_off[i]);
+                        let wanted = |i: usize| !gone[i] && edge_wanted(linked[i], extend == Some(i) || viewing == Some(i), enabled[i] && control_on[i] && !held_off[i]);
                         sync_edges(capture, &config.peers, &mut armed, wanted).await?;
                     }
                     publish(&names, &handover, degraded, &mut shown);
@@ -565,6 +572,7 @@ pub async fn session(
                             armed.push(false);
                             linked.push(false);
                             enabled.push(true);
+                            control_on.push(!server);
                             held_off.push(false);
                             if let Some(emulation) = emulation.as_mut() {
                                 emulation.create(i as CaptureHandle).await;
@@ -661,13 +669,34 @@ pub async fn session(
                         if let Err(e) = crate::set_enabled(&config_path, &peer, on) {
                             warn!(%peer, "cannot save the switch: {e}");
                         }
-                        let want = edge_wanted(linked[i], extend == Some(i) || viewing == Some(i), on && !held_off[i]);
+                        let want = edge_wanted(linked[i], extend == Some(i) || viewing == Some(i), on && control_on[i] && !held_off[i]);
                         if let Some(capture) = capture.as_mut().filter(|_| want != armed[i]) {
                             armed[i] = want;
                             set_edge(capture, i, &config.peers[i], want).await?;
                         }
                         info!(%peer, on, "peer switched");
                     }
+                    publish(&names, &handover, degraded, &mut shown);
+                    continue;
+                }
+                if let Control::Drive(peer, on) = asked {
+                    let Some(i) = live(&names, &gone, &peer).filter(|_| server) else { continue };
+                    if pause_takes_back(handover.sending(), i as CaptureHandle, on) {
+                        info!(%peer, "control turned off while it had the cursor, taking input back");
+                        hand_back(&mut capture, &links, &peer, &mut handover).await?;
+                    }
+                    control_on[i] = on;
+                    config.peers[i].control = on;
+                    status.set_peer(&peer, |p| p.control = on);
+                    if let Err(e) = crate::update_peer(&config_path, &peer, |p| p.control = on) {
+                        warn!(%peer, "cannot save control: {e}");
+                    }
+                    let want = edge_wanted(linked[i], extend == Some(i) || viewing == Some(i), enabled[i] && on && !held_off[i]);
+                    if let Some(capture) = capture.as_mut().filter(|_| want != armed[i]) {
+                        armed[i] = want;
+                        set_edge(capture, i, &config.peers[i], want).await?;
+                    }
+                    info!(%peer, on, "control switched");
                     publish(&names, &handover, degraded, &mut shown);
                     continue;
                 }
@@ -794,7 +823,7 @@ pub async fn session(
                             }
                             held_off[i] = paused;
                             status.set_peer(&peer, |p| p.paused = paused);
-                            let want = edge_wanted(linked[i], extend == Some(i) || viewing == Some(i), enabled[i] && !paused);
+                            let want = edge_wanted(linked[i], extend == Some(i) || viewing == Some(i), enabled[i] && control_on[i] && !paused);
                             if let Some(capture) = capture.as_mut().filter(|_| want != armed[i]) {
                                 armed[i] = want;
                                 set_edge(capture, i, &config.peers[i], want).await?;
@@ -818,7 +847,7 @@ pub async fn session(
                     }
                     Msg::View(on) if !server => {
                         let i = handle as usize;
-                        let want = edge_wanted(linked[i], on, enabled[i] && !held_off[i]);
+                        let want = edge_wanted(linked[i], on, enabled[i] && control_on[i] && !held_off[i]);
                         if let Some(capture) = capture.as_mut().filter(|_| want != armed[i]) {
                             armed[i] = want;
                             set_edge(capture, i, &config.peers[i], want).await?;

@@ -376,6 +376,7 @@ pub async fn host(
                 position: crate::Side::Top,
                 display: None,
                 enabled: false,
+                control: false,
             });
             match step {
                 Step::Ask(_) | Step::Start(_) if peer.is_none() => {}

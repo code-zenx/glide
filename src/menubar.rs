@@ -43,6 +43,7 @@ struct Device {
     row: Retained<NSMenuItem>,
     on: Retained<NSMenuItem>,
     off: Retained<NSMenuItem>,
+    control: Retained<NSMenuItem>,
     extend: Retained<NSMenuItem>,
     view: Retained<NSMenuItem>,
     /// What the row shows now, so an unchanged second redraws nothing.
@@ -55,6 +56,7 @@ struct Shown {
     dot: Dot,
     text: String,
     switched_on: bool,
+    control: bool,
     extending: bool,
     can_extend: bool,
     reachable: bool,
@@ -146,6 +148,14 @@ define_class!(
             if let Some(name) = self.device(sender) {
                 let _ = self.ivars().control.send(Control::SetEnabled(name, false));
             }
+        }
+
+        /// Let the cursor cross into this device, or stop it.
+        #[unsafe(method(deviceControl:))]
+        fn device_control(&self, sender: &NSMenuItem) {
+            let Some(name) = self.device(sender) else { return };
+            let on = self.ivars().status.snapshot().peers.iter().any(|p| p.name == name && p.control);
+            let _ = self.ivars().control.send(Control::Drive(name, !on));
         }
 
         /// Make this device the extended display, or stop if it already is.
@@ -278,12 +288,14 @@ fn device_row(mtm: MainThreadMarker, target: &MenuTarget, index: usize, name: &s
     };
     let on = item("On", sel!(deviceOn:));
     let off = item("Off", sel!(deviceOff:));
+    let control = item("Control", sel!(deviceControl:));
     let extend = item("Use as Extended Display", sel!(deviceExtend:));
     let view = item("View Screen", sel!(deviceView:));
     let forget = item(&format!("Forget {name}…"), sel!(deviceForget:));
     submenu.addItem(&on);
     submenu.addItem(&off);
     submenu.addItem(&NSMenuItem::separatorItem(mtm));
+    submenu.addItem(&control);
     submenu.addItem(&extend);
     submenu.addItem(&view);
     submenu.addItem(&NSMenuItem::separatorItem(mtm));
@@ -294,6 +306,7 @@ fn device_row(mtm: MainThreadMarker, target: &MenuTarget, index: usize, name: &s
         row,
         on,
         off,
+        control,
         extend,
         view,
         shown: RefCell::new(None),
@@ -306,6 +319,7 @@ fn update_row(device: &Device, state: &State, peer: &PeerState) {
         dot,
         text,
         switched_on: peer.mode != "off",
+        control: peer.control,
         extending: state.extending == peer.name,
         can_extend: peer.can_extend,
         reachable: matches!(peer.mode.as_str(), "local"),
@@ -329,6 +343,7 @@ fn update_row(device: &Device, state: &State, peer: &PeerState) {
     };
     device.on.setState(tick(now.switched_on));
     device.off.setState(tick(!now.switched_on));
+    device.control.setState(tick(now.control));
     device.extend.setState(tick(now.extending));
     device
         .extend

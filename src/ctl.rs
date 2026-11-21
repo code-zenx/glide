@@ -32,7 +32,7 @@ pub enum Asked {
 }
 
 const USAGE: &str =
-    "pause, resume, release, peer on|off|forget <name>, extend <name>|off, view <name>|off, invite";
+    "pause, resume, release, peer on|off|forget <name>, peer control on|off <name>, extend <name>|off, view <name>|off, invite";
 
 /// `names` is the current device list, so a typo is refused with a reason
 /// instead of silently doing nothing.
@@ -46,6 +46,7 @@ pub fn parse(line: &str, names: &[String]) -> Result<Asked> {
         ["resume"] => Control::Pause(false),
         ["release"] => Control::Release,
         ["peer", switch @ ("on" | "off"), name] => Control::SetEnabled(known(name)?, switch == "on"),
+        ["peer", "control", switch @ ("on" | "off"), name] => Control::Drive(known(name)?, switch == "on"),
         ["peer", "forget", name] => Control::Forget(known(name)?),
         ["extend", "off"] => Control::Extend(None),
         ["extend", name] => Control::Extend(Some(known(name)?)),
@@ -141,6 +142,8 @@ mod tests {
         assert!(matches!(control("release"), Control::Release));
         assert!(matches!(control("peer off anton"), Control::SetEnabled(n, false) if n == "anton"));
         assert!(matches!(control("  peer on anorak \n"), Control::SetEnabled(n, true) if n == "anorak"));
+        assert!(matches!(control("peer control on anton"), Control::Drive(n, true) if n == "anton"));
+        assert!(matches!(control("peer control off anton"), Control::Drive(n, false) if n == "anton"));
         assert!(matches!(control("peer forget anton"), Control::Forget(n) if n == "anton"));
         assert!(matches!(control("extend anorak"), Control::Extend(Some(n)) if n == "anorak"));
         assert!(matches!(control("extend off"), Control::Extend(None)));
@@ -178,7 +181,7 @@ mod tests {
             let links = Arc::new(Links::new(
                 names()
                     .into_iter()
-                    .map(|name| crate::Peer { name, addrs: vec![], fingerprint: String::new(), position: crate::Side::Left, display: None, enabled: true })
+                    .map(|name| crate::Peer { name, addrs: vec![], fingerprint: String::new(), position: crate::Side::Left, display: None, enabled: true, control: false })
                     .collect(),
                 true,
             ));

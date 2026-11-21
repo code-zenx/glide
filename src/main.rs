@@ -164,6 +164,10 @@ pub struct Peer {
     /// accepts it, and tells it so, so nothing at all crosses.
     #[serde(default = "yes", skip_serializing_if = "is_yes")]
     pub enabled: bool,
+    /// The server's cursor may cross into this peer. Off by default: a peer
+    /// that is on shares the clipboard only, until Control is chosen.
+    #[serde(default, skip_serializing_if = "is_no")]
+    pub control: bool,
 }
 
 fn yes() -> bool {
@@ -172,6 +176,10 @@ fn yes() -> bool {
 
 fn is_yes(on: &bool) -> bool {
     *on
+}
+
+fn is_no(on: &bool) -> bool {
+    !*on
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
@@ -272,6 +280,7 @@ pub fn add_peer(path: &Path, name: &str, fingerprint: &str, addr: SocketAddr, sc
                 position,
                 display,
                 enabled: true,
+                control: false,
             };
             config.peers.push(peer.clone());
             peer
@@ -342,13 +351,18 @@ pub fn set_peer_addrs(path: &Path, peer_name: &str, addrs: Vec<SocketAddr>) -> R
 
 /// Remember whether a peer is switched on, so a pause survives a restart.
 pub fn set_enabled(path: &Path, peer_name: &str, on: bool) -> Result<()> {
+    update_peer(path, peer_name, |peer| peer.enabled = on)
+}
+
+/// Change one peer's entry in the config file and save it.
+pub fn update_peer(path: &Path, peer_name: &str, change: impl FnOnce(&mut Peer)) -> Result<()> {
     let mut config = load(path)?;
     let peer = config
         .peers
         .iter_mut()
         .find(|p| p.name == peer_name)
         .with_context(|| format!("no peer named {peer_name}"))?;
-    peer.enabled = on;
+    change(peer);
     std::fs::write(path, toml::to_string_pretty(&config)?)?;
     Ok(())
 }
@@ -656,6 +670,24 @@ mod tests {
         assert!(!text.contains("enabled"), "on is the default and stays out of the file: {text}");
     }
 
+    #[test]
+    fn control_defaults_to_off_and_is_remembered() {
+        let path = std::env::temp_dir().join(format!("glide-config-control-{}.toml", std::process::id()));
+        std::fs::write(
+            &path,
+            "name = \"goldengate\"\nrole = \"server\"\n\
+             [[peer]]\nname = \"anton\"\naddrs = [\"192.168.0.5:4242\"]\nposition = \"left\"\nfingerprint = \"bb\"\n",
+        )
+        .unwrap();
+        assert!(!load(&path).unwrap().peers[0].control, "a config without the field means clipboard only");
+        update_peer(&path, "anton", |p| p.control = true).unwrap();
+        assert!(load(&path).unwrap().peers[0].control);
+        update_peer(&path, "anton", |p| p.control = false).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(!text.contains("\ncontrol ="), "off is the default and stays out of the file: {text}");
+    }
+
     fn screen(x: i32, y: i32, w: u32, h: u32) -> screens::Screen {
         screens::Screen { name: "s".into(), x, y, w, h }
     }
@@ -665,7 +697,7 @@ mod tests {
         // The LG and the portrait Dell to its right: the LG's right edge is the
         // Dell, so it is never offered.
         let screens = [screen(0, 0, 2560, 1080), screen(2560, 0, 1080, 1920)];
-        let peer = |side, display| Peer { name: "p".into(), addrs: vec![], fingerprint: String::new(), position: side, display, enabled: true };
+        let peer = |side, display| Peer { name: "p".into(), addrs: vec![], fingerprint: String::new(), position: side, display, enabled: true, control: false };
         assert_eq!(free_edge(&[], &screens), (Side::Left, Some(1)));
         let taken = [peer(Side::Top, Some(1)), peer(Side::Left, Some(1))];
         assert_eq!(free_edge(&taken, &screens), (Side::Bottom, Some(1)));

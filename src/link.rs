@@ -467,6 +467,7 @@ pub(crate) fn loopback(dir: &Path) -> Result<(Net, Net, Peer)> {
             position: Side::Right,
             display: None,
             enabled: true,
+            control: false,
         }],
     };
     let trusting = |c: &Config| Arc::new(Links::new(c.peers.clone(), false));
@@ -1034,7 +1035,7 @@ mod tests {
             role,
             listen: "127.0.0.1:0".parse().unwrap(),
             display: Default::default(),
-            peers: vec![Peer { name: "peer".into(), addrs: vec![], fingerprint: peer.fingerprint(), position: Side::Right, display: None, enabled }],
+            peers: vec![Peer { name: "peer".into(), addrs: vec![], fingerprint: peer.fingerprint(), position: Side::Right, display: None, enabled, control: false }],
         };
         let (server_cfg, client_cfg) = (config(&id_client, Role::Server, false), config(&id_server, Role::Client, true));
         let server_links = Arc::new(Links::new(server_cfg.peers.clone(), true));
@@ -1091,6 +1092,7 @@ mod tests {
                 position: Side::Right,
                 display: None,
                 enabled: true,
+                control: false,
             }],
         };
         let (cfg_here, cfg_there) = (config(&id_there, "here"), config(&id_here, "there"));

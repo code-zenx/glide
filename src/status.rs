@@ -26,6 +26,8 @@ pub struct PeerState {
     /// Whether the peer can send its screen for View Screen. In process only,
     /// like `can_extend`; false until the peer says otherwise.
     pub can_view: bool,
+    /// Whether the server's cursor may cross into the peer. In process only.
+    pub control: bool,
 }
 
 impl PeerState {
@@ -37,6 +39,7 @@ impl PeerState {
             paused: false,
             can_extend: true,
             can_view: false,
+            control: false,
         }
     }
 }
@@ -269,6 +272,7 @@ impl State {
                         paused: paused == "true",
                         can_extend: true,
                         can_view: false,
+                        control: false,
                     }),
                     _ => old_peer = Some(value.to_string()),
                 },
