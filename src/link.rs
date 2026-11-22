@@ -50,6 +50,8 @@ const PAIR_ALPN: &[u8] = b"glide-pair/0";
 pub const OFF: u32 = 1;
 /// Close code for "this server forgot you".
 pub const FORGOTTEN: u32 = 2;
+/// Close code for "both of us dialed; the link the server dialed is kept".
+const REPLACED: u32 = 3;
 /// How often a client the server switched off checks whether it is back on,
 /// in case the server cannot reach it (new DHCP lease, inbound port blocked).
 const OFF_PROBE: Duration = Duration::from_secs(60);
@@ -70,9 +72,15 @@ const MAX_FRAME: usize = 1 << 16;
 const MAX_BULK: usize = crate::clipboard::MAX_IMAGE + (1 << 16);
 
 /// Every peer this machine knows, and the ones it can currently talk to.
+/// A peer's live link: where its messages go, and whether the server dialed it.
+struct Live {
+    tx: UnboundedSender<Msg>,
+    by_server: bool,
+}
+
 #[derive(Default)]
 pub struct Links {
-    peers: Mutex<HashMap<String, UnboundedSender<Msg>>>,
+    peers: Mutex<HashMap<String, Live>>,
     conns: Mutex<HashMap<String, Connection>>,
     /// The configured peers, kept current as devices are paired and forgotten,
     /// so dialing, certificate checks and the clipboard all see the same list.
@@ -161,19 +169,22 @@ impl Links {
     /// Send to one peer. Silently does nothing when that peer is not connected:
     /// input for a machine that just dropped off has nowhere useful to go.
     pub fn send(&self, peer: &str, msg: Msg) {
-        if let Some(tx) = self.peers.lock().unwrap().get(peer) {
-            let _ = tx.send(msg);
+        if let Some(live) = self.peers.lock().unwrap().get(peer) {
+            let _ = live.tx.send(msg);
         }
     }
 
-    /// Claim the link to this peer. False when one already exists: both
-    /// machines dial each other, and the loser of that race hangs up.
-    fn try_register(&self, peer: &str, tx: UnboundedSender<Msg>) -> bool {
+    /// Claim the link to this peer. Both machines dial each other, so two
+    /// links can come up at once; the one the server dialed wins on both ends.
+    /// Were each end to keep its own, each would hang up the other's and both
+    /// would die. False when this link lost and must hang up.
+    fn try_register(&self, peer: &str, tx: UnboundedSender<Msg>, by_server: bool) -> bool {
         let mut peers = self.peers.lock().unwrap();
-        if peers.get(peer).is_some_and(|existing| !existing.is_closed()) {
+        let held = peers.get(peer).filter(|live| !live.tx.is_closed());
+        if held.is_some_and(|live| live.by_server || !by_server) {
             return false;
         }
-        peers.insert(peer.to_string(), tx);
+        peers.insert(peer.to_string(), Live { tx, by_server });
         true
     }
 
@@ -181,12 +192,19 @@ impl Links {
     /// letting its capture take the cursor: grabbing it with nowhere to send it
     /// swallows the keyboard and mouse and leaves no way to reach the menu bar.
     pub fn connected(&self, peer: &str) -> bool {
-        self.peers.lock().unwrap().get(peer).is_some_and(|tx| !tx.is_closed())
+        self.peers.lock().unwrap().get(peer).is_some_and(|live| !live.tx.is_closed())
     }
 
-    fn unregister(&self, peer: &str) {
-        self.peers.lock().unwrap().remove(peer);
+    /// Drop this link, unless a link the server dialed has replaced it. True
+    /// when it was still this peer's link, so the peer is now gone.
+    fn unregister(&self, peer: &str, tx: &UnboundedSender<Msg>) -> bool {
+        let mut peers = self.peers.lock().unwrap();
+        if !peers.get(peer).is_some_and(|live| live.tx.same_channel(tx)) {
+            return false;
+        }
+        peers.remove(peer);
         self.conns.lock().unwrap().remove(peer);
+        true
     }
 }
 
@@ -718,11 +736,14 @@ async fn serve(
     let _ = send.flush().await;
 
     let (tx, rx) = unbounded_channel::<Msg>();
-    if !links.try_register(peer, tx.clone()) {
+    if !links.try_register(peer, tx.clone(), dialer == links.server) {
         debug!(%peer, "already linked, dropping the duplicate connection");
         return Ok(());
     }
-    links.conns.lock().unwrap().insert(peer.to_string(), conn.clone());
+    if let Some(replaced) = links.conns.lock().unwrap().insert(peer.to_string(), conn.clone()) {
+        debug!(%peer, "both ends dialed; keeping the link the server dialed");
+        replaced.close(REPLACED.into(), b"replaced");
+    }
     if !links.server {
         // The server came back for us, so it has switched us on again.
         links.set_off(peer, false);
@@ -751,14 +772,17 @@ async fn serve(
         result = datagrams(&conn, peer, started, &tx, status, to_session) => result,
     };
 
+    pinger.abort();
+    writer.abort();
+    // A link replaced by the one the server dialed leaves the peer connected.
+    if !links.unregister(peer, &tx) {
+        return result;
+    }
     status.offline(peer);
     if links.is_off(peer) {
         status.set_peer(peer, |p| p.mode = "off".into());
     }
-    links.unregister(peer);
     let _ = link_state.send((peer.to_string(), false));
-    pinger.abort();
-    writer.abort();
     // Whoever had the cursor, they no longer do; let the session put input back
     // where it belongs rather than leaving it pointed at a dead link.
     let _ = to_session.send((peer.to_string(), Msg::Leave));
@@ -993,14 +1017,29 @@ mod tests {
         let links = Links::default();
         links.send("ghost", Msg::Enter); // must not panic
         let (tx, mut rx) = unbounded_channel();
-        assert!(links.try_register("mybox", tx));
+        assert!(links.try_register("mybox", tx.clone(), true));
         links.send("mybox", Msg::Enter);
         assert_eq!(rx.try_recv().unwrap(), Msg::Enter);
         let (second, _second_rx) = unbounded_channel();
-        assert!(!links.try_register("mybox", second), "a second link must be refused");
-        links.unregister("mybox");
+        assert!(!links.try_register("mybox", second, true), "a second link must be refused");
+        assert!(links.unregister("mybox", &tx));
         links.send("mybox", Msg::Leave);
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn when_both_dial_the_link_the_server_dialed_wins() {
+        let links = Links::default();
+        let (own, _own_rx) = unbounded_channel();
+        assert!(links.try_register("mac", own.clone(), false), "this end's own dial comes up first");
+        let (servers, mut servers_rx) = unbounded_channel();
+        assert!(links.try_register("mac", servers.clone(), true), "the server's dial replaces it");
+        let (late, _late_rx) = unbounded_channel();
+        assert!(!links.try_register("mac", late, false), "and is never replaced by a non-server dial");
+        assert!(!links.unregister("mac", &own), "the replaced link's teardown leaves the peer linked");
+        links.send("mac", Msg::Enter);
+        assert_eq!(servers_rx.try_recv().unwrap(), Msg::Enter);
+        assert!(links.unregister("mac", &servers));
     }
 
     /// A clipboard image must never be able to claim the reliable stream, or a
