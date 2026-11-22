@@ -4,7 +4,7 @@
 //!
 //! The Mac asks with `Msg::View(true)`; the peer answers `ViewReady` with the
 //! mode of the screen it will send. The Mac then dials a connection of its
-//! own (ALPN `glide-view/0`, see `link.rs`), and the peer opens two streams
+//! own (ALPN `glide-view/1`, see `link.rs`), and the peer opens two streams
 //! back on it: video, framed exactly like an extended display's
 //! (`display::send_frames`), and sound, as `[u32 len][packet]` frames of Opus,
 //! or of raw PCM where the peer has no Opus encoder. Each stream starts with

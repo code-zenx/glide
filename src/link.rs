@@ -41,8 +41,9 @@ use crate::{Config, Peer};
 const ALPN: &[u8] = b"glide/0";
 const VIDEO_ALPN: &[u8] = b"glide-video/0";
 /// View Screen: the Mac dials the peer, and the peer streams its screen and
-/// sound back.
-const VIEW_ALPN: &[u8] = b"glide-view/0";
+/// sound back. Bumped to /1 when sound gained Opus: a build that
+/// cannot read it then fails at connect, not mid-stream.
+const VIEW_ALPN: &[u8] = b"glide-view/1";
 /// `glide join`: a machine that is not trusted yet, presenting an invite.
 const PAIR_ALPN: &[u8] = b"glide-pair/0";
 /// Close code for "this server switched you off". The client stops dialing
