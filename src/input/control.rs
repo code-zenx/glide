@@ -5,7 +5,6 @@ use anyhow::Result;
 use input_capture::CaptureHandle;
 use tracing::{info, warn};
 
-use super::edge::set_edge;
 use super::{live, open_capture, open_emulation, release, Session};
 use crate::proto::Msg;
 use crate::{display, view, Peer, Side};
@@ -273,11 +272,10 @@ impl Session {
     async fn retry_backends(&mut self) -> Result<()> {
         if self.capture.is_none() {
             self.capture = open_capture().await;
-            if let Some(capture) = self.capture.as_mut() {
-                let armed = self.config.peers.iter().enumerate().filter(|&(i, _)| self.armed[i] && !self.gone[i]);
-                for (i, peer) in armed {
-                    set_edge(capture, i, peer, true).await?;
-                }
+            if self.capture.is_some() {
+                // No edge is ever armed without a capture behind it, so none
+                // is yet: arm every one the rules want, for peers already linked.
+                self.sync_edges().await?;
                 info!("input capture is working now");
             }
         }
