@@ -167,12 +167,14 @@ fn require(element: &str, package: &str) -> Result<()> {
     }
 }
 
-/// The hardware encoder when there is one; x264 on the CPU otherwise.
+/// The hardware encoder when there is one, with the GPU converting colours
+/// for it (`vapostproc`, same plugin) instead of the CPU; x264 on the CPU
+/// otherwise.
 fn encoder() -> Result<&'static str> {
     if gst::ElementFactory::find("vah264enc").is_some() {
-        Ok("vah264enc name=enc")
+        Ok("vapostproc ! vah264enc name=enc")
     } else if gst::ElementFactory::find("x264enc").is_some() {
-        Ok("x264enc name=enc tune=zerolatency speed-preset=ultrafast")
+        Ok("videoconvert n-threads=0 ! x264enc name=enc tune=zerolatency speed-preset=ultrafast")
     } else {
         bail!("install gst-plugin-va or gst-plugins-ugly (for an H.264 encoder)")
     }
@@ -198,7 +200,7 @@ impl Encoder {
             ),
         };
         let pipeline = launch(&format!(
-            "{source} ! videoconvert n-threads=0 ! {} ! {TAIL}",
+            "{source} ! {} ! {TAIL}",
             encoder()?
         ))?;
         let enc = pipeline.by_name("enc").context("no encoder")?;
