@@ -7,8 +7,12 @@
 //! and asked for a keyframe, needs a frame to get it from. The cursor is drawn
 //! into the frames by the compositor.
 //!
-//! ponytail: a CPU copy of every frame (about 500 MB/s at 1080p60). DMA-BUF
-//! straight into the encoder is the upgrade if the CPU ever notices.
+//! ponytail: a CPU copy of every frame (about 500 MB/s at 1080p60). Measured
+//! 2026-11-22 on anorak (i5-10500T), screen changing every frame at 1080p60:
+//! glide 32% of one core (half this copy, half the upload to the GPU) and
+//! Hyprland 16% for its readback, about 4% of the machine; a still screen
+//! costs next to nothing. DMA-BUF straight into the encoder removes all three
+//! if that ever matters; the `capture_cost` test measures it again.
 
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::ptr::null_mut;
@@ -404,3 +408,43 @@ delegate_noop!(State: ZwlrScreencopyManagerV1);
 delegate_noop!(State: WlShmPool);
 delegate_noop!(State: ignore WlShm);
 delegate_noop!(State: ignore WlBuffer);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gst::prelude::*;
+
+    /// What View Screen's capture costs at full speed: copy the screen into
+    /// the GPU encoder for five seconds, then print frames per second and this
+    /// process's CPU. Needs a Hyprland session:
+    /// `cargo test --release capture_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn capture_cost() {
+        gst::init().unwrap();
+        let pipeline = gst::parse::launch("appsrc name=src is-live=true format=time do-timestamp=true ! vapostproc ! vah264enc ! fakesink sync=false").unwrap();
+        let pipeline = pipeline.downcast::<gst::Pipeline>().unwrap();
+        let src = pipeline.by_name("src").unwrap().downcast::<gst_app::AppSrc>().unwrap();
+        pipeline.set_state(gst::State::Playing).unwrap();
+        let mut session = Session::connect("").unwrap();
+        let (stop, mut pool, mut frames) = (AtomicBool::new(false), None, 0);
+        let (cpu, started) = (cpu_seconds(), Instant::now());
+        while started.elapsed() < Duration::from_secs(5) {
+            if let Some(buffer) = session.frame(&mut pool, true, &stop).unwrap() {
+                set_caps(&src, pool.as_ref().map(|p| p.spec), 60);
+                src.push_buffer(buffer).unwrap();
+                frames += 1;
+            }
+        }
+        let wall = started.elapsed().as_secs_f64();
+        println!("{:.0} fps, {:.0}% of one core", frames as f64 / wall, (cpu_seconds() - cpu) / wall * 100.0);
+        pipeline.set_state(gst::State::Null).unwrap();
+    }
+
+    fn cpu_seconds() -> f64 {
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) };
+        let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 / 1e6;
+        secs(usage.ru_utime) + secs(usage.ru_stime)
+    }
+}
