@@ -177,6 +177,9 @@ async fn pair(
     links.upsert(peer.clone());
     status.set_peer(&name, |p| p.mode = "offline".into());
     let _ = control.send(crate::input::Control::AddPeer(peer.clone()));
+    // A new device arrives on; only one is on at a time, so this switches the
+    // others off through the same path as the menu.
+    let _ = control.send(crate::input::Control::SetEnabled(name.clone(), true));
     Ok(peer)
 }
 
@@ -415,6 +418,8 @@ mod tests {
         assert_eq!(added.fingerprint, client_id.fingerprint(), "the key comes from its certificate");
         assert!(links.peer("newbox").is_some(), "the running daemon trusts it at once");
         assert!(matches!(asked.recv().await, Some(crate::input::Control::AddPeer(p)) if p.name == "newbox"));
+        let switched = asked.recv().await;
+        assert!(matches!(switched, Some(crate::input::Control::SetEnabled(n, true)) if n == "newbox"), "and is switched on, so the others go off");
         let mine = crate::load(&client_cfg)?;
         assert_eq!(mine.role, crate::Role::Client);
         let theirs = &mine.peers[0];
