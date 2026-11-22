@@ -12,8 +12,8 @@
 //! capture and encoder callbacks run on their own queues and only ever touch
 //! the frame `Slot`.
 
-use std::ffi::{c_void, CStr};
-use std::ptr::{null_mut, NonNull};
+use std::ffi::CStr;
+use std::ptr::null_mut;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,46 +21,30 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchQueueAttr, DispatchRetained};
-use objc2::rc::{Allocated, Retained};
+use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, AnyThread, DefinedClass};
-use objc2_core_foundation::{CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType, CGSize};
-use objc2_core_video::{
-    kCVImageBufferColorPrimaries_ITU_R_709_2, kCVImageBufferTransferFunction_ITU_R_709_2,
-    kCVImageBufferYCbCrMatrix_ITU_R_709_2,
-};
-use objc2_core_media::{
-    kCMSampleAttachmentKey_NotSync, kCMTimeInvalid, kCMVideoCodecType_HEVC, CMSampleBuffer, CMTime,
-    CMVideoFormatDescriptionGetHEVCParameterSetAtIndex,
-};
+use objc2_core_foundation::{CFDictionary, CFRetained, CFString, CFType};
+use objc2_core_video::kCVImageBufferYCbCrMatrix_ITU_R_709_2;
+use objc2_core_media::{kCMTimeInvalid, CMSampleBuffer, CMTime};
 use objc2_foundation::{NSArray, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSString};
 use objc2_screen_capture_kit::{
     SCContentFilter, SCDisplay, SCFrameStatus, SCShareableContent, SCStream, SCStreamConfiguration,
     SCStreamFrameInfoStatus, SCStreamOutput, SCStreamOutputType,
 };
-use objc2_video_toolbox::{
-    kVTCompressionPropertyKey_AllowFrameReordering, kVTCompressionPropertyKey_AverageBitRate,
-    kVTCompressionPropertyKey_ColorPrimaries, kVTCompressionPropertyKey_TransferFunction,
-    kVTCompressionPropertyKey_YCbCrMatrix,
-    kVTCompressionPropertyKey_ExpectedFrameRate, kVTCompressionPropertyKey_MaxFrameDelayCount,
-    kVTCompressionPropertyKey_MaxKeyFrameInterval,
-    kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kVTCompressionPropertyKey_ProfileLevel,
-    kVTCompressionPropertyKey_RealTime, kVTEncodeFrameOptionKey_ForceKeyFrame,
-    kVTProfileLevel_HEVC_Main_AutoLevel, kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
-    kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, VTCompressionSession,
-    VTEncodeInfoFlags, VTSessionSetProperty,
-};
+use objc2_video_toolbox::VTCompressionSession;
 
-use crate::display::{Frame, Slot};
+mod hevc;
+mod virtual_display;
+
+use crate::display::Slot;
 use crate::proto::ScreenMode;
-use crate::screens::Screen;
 use crate::Side;
+use hevc::{encoder, force_key};
+use virtual_display::{arrange, use_hidpi, virtual_display};
 
 /// '420v': the encoder's own input format, so nothing converts in between.
 const PIXEL_FORMAT: u32 = u32::from_be_bytes(*b"420v");
-/// A virtual display with no scaling reports 96 dpi, the same as the monitor it
-/// stands in for is assumed to have.
-const MM_PER_PIXEL: f64 = 25.4 / 96.0;
 /// How long macOS may take to list a virtual display it just created.
 const APPEAR_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -68,14 +52,7 @@ const APPEAR_TIMEOUT: Duration = Duration::from_secs(5);
 unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGRequestScreenCaptureAccess() -> bool;
-    fn CGBeginDisplayConfiguration(config: *mut *mut c_void) -> i32;
-    fn CGConfigureDisplayOrigin(config: *mut c_void, display: u32, x: i32, y: i32) -> i32;
-    fn CGCompleteDisplayConfiguration(config: *mut c_void, option: u32) -> i32;
 }
-
-/// kCGConfigureForSession: kept until logout, never written to the user's
-/// saved arrangement.
-const FOR_SESSION: u32 = 1;
 
 /// Where the peer's screen sits: which edge, of which display (1-based, as the
 /// Arrange window numbers them), or of the whole desktop when none is named.
@@ -219,169 +196,6 @@ pub(crate) fn class(name: &CStr) -> Result<&'static AnyClass> {
     AnyClass::get(name).with_context(|| format!("{name:?} is missing from this macOS"))
 }
 
-/// How much larger than the client's monitor each offered mode is drawn. In
-/// HiDPI, 2× reads as "looks like" the monitor's own size at Retina
-/// sharpness, and the smaller steps give bigger text; 1× is plain pixels.
-const HIDPI_SCALES: [f64; 4] = [2.0, 5.0 / 3.0, 4.0 / 3.0, 1.0];
-
-/// The pixel sizes the virtual display offers, largest (the default) first.
-/// Kept even: encoders and scalers dislike odd sizes.
-fn modes(screen: ScreenMode, hidpi: bool) -> Vec<(u32, u32)> {
-    let scales: &[f64] = if hidpi { &HIDPI_SCALES } else { &[1.0] };
-    scales
-        .iter()
-        .map(|s| {
-            let even = |n: u32| ((n as f64 * s).round() as u32) & !1;
-            (even(screen.w), even(screen.h))
-        })
-        .collect()
-}
-
-/// A screen macOS believes is plugged in, sized for the client's monitor.
-fn virtual_display(screen: ScreenMode, hidpi: bool, queue: &DispatchQueue) -> Result<(Retained<AnyObject>, u32)> {
-    let offered = modes(screen, hidpi);
-    let (max_w, max_h) = offered[0];
-    unsafe {
-        let descriptor: Retained<AnyObject> = msg_send![class(c"CGVirtualDisplayDescriptor")?, new];
-        let _: () = msg_send![&descriptor, setDispatchQueue: queue];
-        let _: () = msg_send![&descriptor, setName: &*NSString::from_str("Glide")];
-        let _: () = msg_send![&descriptor, setMaxPixelsWide: max_w];
-        let _: () = msg_send![&descriptor, setMaxPixelsHigh: max_h];
-        let size = CGSize::new(screen.w as f64 * MM_PER_PIXEL, screen.h as f64 * MM_PER_PIXEL);
-        let _: () = msg_send![&descriptor, setSizeInMillimeters: size];
-        // Stable IDs, so macOS remembers where this screen was arranged.
-        let _: () = msg_send![&descriptor, setVendorID: 0x676c_u32];
-        let _: () = msg_send![&descriptor, setProductID: 0x6964_u32];
-        let _: () = msg_send![&descriptor, setSerialNum: 1_u32];
-
-        let allocated: Allocated<AnyObject> = msg_send![class(c"CGVirtualDisplay")?, alloc];
-        let display: Option<Retained<AnyObject>> = msg_send![allocated, initWithDescriptor: &*descriptor];
-        let display = display.context("macOS refused to create a virtual display")?;
-
-        let mode_class = class(c"CGVirtualDisplayMode")?;
-        let mut all = Vec::with_capacity(offered.len());
-        for (w, h) in offered {
-            let allocated: Allocated<AnyObject> = msg_send![mode_class, alloc];
-            let mode: Retained<AnyObject> =
-                msg_send![allocated, initWithWidth: w, height: h, refreshRate: screen.hz as f64];
-            all.push(mode);
-        }
-        let settings: Retained<AnyObject> = msg_send![class(c"CGVirtualDisplaySettings")?, new];
-        let _: () = msg_send![&settings, setHiDPI: hidpi as u32];
-        let modes = NSArray::from_retained_slice(&all);
-        let _: () = msg_send![&settings, setModes: &*modes];
-        let applied: bool = msg_send![&display, applySettings: &*settings];
-        if !applied {
-            bail!("macOS refused {}×{} at {} Hz for the virtual display", screen.w, screen.h, screen.hz);
-        }
-        let id: u32 = msg_send![&display, displayID];
-        Ok((display, id))
-    }
-}
-
-/// Put the virtual display where the Arrange window has the peer, so the
-/// cursor leaves through the same edge in Extend as in Control.
-fn arrange(id: u32, screen: ScreenMode, place: Place) -> Result<()> {
-    let screens = crate::screens::local();
-    let target = place
-        .display
-        .and_then(|n| screens.get(n.checked_sub(1)?).cloned())
-        .or_else(|| union(&screens))
-        .context("no real display to sit beside")?;
-    let (x, y) = beside(&target, screen.w as i32, screen.h as i32, place.side);
-    unsafe {
-        let mut config = null_mut();
-        if CGBeginDisplayConfiguration(&mut config) != 0 {
-            bail!("CGBeginDisplayConfiguration failed");
-        }
-        CGConfigureDisplayOrigin(config, id, x, y);
-        let status = CGCompleteDisplayConfiguration(config, FOR_SESSION);
-        if status != 0 {
-            bail!("macOS refused the arrangement (status {status})");
-        }
-    }
-    tracing::info!(x, y, side = ?place.side, display = ?place.display, "virtual display placed");
-    Ok(())
-}
-
-/// The box around every display: the whole desktop.
-fn union(screens: &[Screen]) -> Option<Screen> {
-    let left = screens.iter().map(|s| s.x).min()?;
-    let top = screens.iter().map(|s| s.y).min()?;
-    let right = screens.iter().map(|s| s.x + s.w as i32).max()?;
-    let bottom = screens.iter().map(|s| s.y + s.h as i32).max()?;
-    Some(Screen { name: String::new(), x: left, y: top, w: (right - left) as u32, h: (bottom - top) as u32 })
-}
-
-/// The origin of a `w`×`h` screen touching `target` along `side`, centred on
-/// that edge. macOS coordinates: y grows downward from the main display's top.
-fn beside(target: &Screen, w: i32, h: i32, side: Side) -> (i32, i32) {
-    let (tw, th) = (target.w as i32, target.h as i32);
-    match side {
-        Side::Top => (target.x + (tw - w) / 2, target.y - h),
-        Side::Bottom => (target.x + (tw - w) / 2, target.y + th),
-        Side::Left => (target.x - w, target.y + (th - h) / 2),
-        Side::Right => (target.x + tw, target.y + (th - h) / 2),
-    }
-}
-
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" {
-    fn CGDisplayCopyAllDisplayModes(display: u32, options: *const c_void) -> *const c_void;
-    fn CGDisplayModeGetWidth(mode: *const c_void) -> usize;
-    fn CGDisplayModeGetHeight(mode: *const c_void) -> usize;
-    fn CGDisplayModeGetPixelWidth(mode: *const c_void) -> usize;
-    fn CGConfigureDisplayWithDisplayMode(config: *mut c_void, display: u32, mode: *const c_void, options: *const c_void) -> i32;
-}
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    fn CFArrayGetCount(array: *const c_void) -> isize;
-    fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
-    fn CFRelease(cf: *mut c_void);
-}
-
-/// Switch to the HiDPI mode that looks like the client's monitor: drawn at
-/// twice its pixels, shown at its size. macOS starts a new virtual display at
-/// 1x, and may take a moment to list the rest.
-///
-/// ponytail: sets this default every time Extend starts, so a scaled mode
-/// picked in RDM or System Settings lasts until the display is next rebuilt.
-unsafe fn use_hidpi(id: u32, screen: ScreenMode) -> Result<()> {
-    // The value of kCGDisplayShowDuplicateLowResolutionModes, which is not
-    // its own name. Without it the HiDPI modes are left out of the list.
-    let key = NSString::from_str("kCGDisplayResolution");
-    let options = NSDictionary::from_slices(&[&*key], &[&*NSNumber::numberWithBool(true)]);
-    let (w, h) = (screen.w as usize, screen.h as usize);
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    while std::time::Instant::now() < deadline {
-        let list = unsafe { CGDisplayCopyAllDisplayModes(id, Retained::as_ptr(&options).cast()) };
-        if !list.is_null() {
-            let found = (0..unsafe { CFArrayGetCount(list) })
-                .map(|i| unsafe { CFArrayGetValueAtIndex(list, i) })
-                .find(|&m| unsafe {
-                    CGDisplayModeGetWidth(m) == w && CGDisplayModeGetHeight(m) == h && CGDisplayModeGetPixelWidth(m) == 2 * w
-                });
-            let applied = found.map(|mode| unsafe {
-                let mut config = null_mut();
-                CGBeginDisplayConfiguration(&mut config);
-                CGConfigureDisplayWithDisplayMode(config, id, mode, std::ptr::null());
-                CGCompleteDisplayConfiguration(config, FOR_SESSION)
-            });
-            unsafe { CFRelease(list as *mut c_void) };
-            match applied {
-                Some(0) => {
-                    tracing::info!(w, h, "virtual display in HiDPI");
-                    return Ok(());
-                }
-                Some(status) => bail!("macOS refused the mode (status {status})"),
-                None => {}
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    bail!("macOS never offered a {w}×{h} HiDPI mode")
-}
-
 /// `SCDisplay` is only handed out through a completion block.
 struct Found(Option<Retained<SCDisplay>>, Option<String>);
 // SAFETY: moved once, from ScreenCaptureKit's callback to the waiting thread.
@@ -406,171 +220,6 @@ fn shareable(id: u32) -> Result<Retained<SCDisplay>> {
             _ => std::thread::sleep(Duration::from_millis(100)),
         }
     }
-}
-
-/// HEVC on the media engine, tuned for latency over everything else: real
-/// time, no B-frames, no frames held back, keyframes only when asked for.
-fn encoder(screen: ScreenMode, bitrate: u32, slot: &Arc<Slot>) -> Result<CFRetained<VTCompressionSession>> {
-    let yes: &CFType = CFBoolean::new(true);
-    let spec = CFDictionary::<CFString, CFType>::from_slices(
-        &[
-            unsafe { kVTVideoEncoderSpecification_EnableLowLatencyRateControl },
-            unsafe { kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder },
-        ],
-        &[yes, yes],
-    );
-    let mut raw: *mut VTCompressionSession = null_mut();
-    let status = unsafe {
-        VTCompressionSession::create(
-            None,
-            screen.w as i32,
-            screen.h as i32,
-            kCMVideoCodecType_HEVC,
-            Some(spec.as_opaque()),
-            None,
-            None,
-            Some(encoded),
-            Arc::as_ptr(slot) as *mut c_void,
-            NonNull::from(&mut raw),
-        )
-    };
-    let session = NonNull::new(raw)
-        .filter(|_| status == 0)
-        .map(|raw| unsafe { CFRetained::from_raw(raw) })
-        .ok_or_else(|| anyhow!("cannot create the HEVC encoder (status {status})"))?;
-
-    let no: &CFType = CFBoolean::new(false);
-    let rate = CFNumber::new_i32(bitrate as i32);
-    let fps = CFNumber::new_i32(screen.hz as i32);
-    // Never on a timer: a reliable stream only needs one after a drop.
-    let key_interval = CFNumber::new_i32(i32::MAX);
-    let zero = CFNumber::new_i32(0);
-    let profile: &CFType = unsafe { kVTProfileLevel_HEVC_Main_AutoLevel };
-    let properties: [(&CFString, &CFType); 11] = unsafe {
-        [
-            (kVTCompressionPropertyKey_RealTime, yes),
-            (kVTCompressionPropertyKey_AllowFrameReordering, no),
-            (kVTCompressionPropertyKey_ProfileLevel, profile),
-            (kVTCompressionPropertyKey_AverageBitRate, &rate),
-            (kVTCompressionPropertyKey_ExpectedFrameRate, &fps),
-            (kVTCompressionPropertyKey_MaxKeyFrameInterval, &key_interval),
-            (kVTCompressionPropertyKey_MaxFrameDelayCount, &zero),
-            (kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, yes),
-            (kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2),
-            (kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2),
-            (kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2),
-        ]
-    };
-    for (key, value) in properties {
-        // Some encoders refuse some keys; each one is a preference, not a need.
-        let status = unsafe { VTSessionSetProperty(&session, key, Some(value)) };
-        if status != 0 {
-            tracing::debug!(%key, status, "encoder declined a setting");
-        }
-    }
-    Ok(session)
-}
-
-fn force_key() -> CFRetained<CFDictionary<CFString, CFType>> {
-    let yes: &CFType = CFBoolean::new(true);
-    CFDictionary::from_slices(&[unsafe { kVTEncodeFrameOptionKey_ForceKeyFrame }], &[yes])
-}
-
-/// VideoToolbox's output callback, on the encoder's own thread.
-unsafe extern "C-unwind" fn encoded(
-    slot: *mut c_void,
-    _frame: *mut c_void,
-    status: i32,
-    _flags: VTEncodeInfoFlags,
-    sample: *mut CMSampleBuffer,
-) {
-    let (Some(slot), Some(sample)) = (unsafe { (slot as *const Slot).as_ref() }, unsafe { sample.as_ref() }) else {
-        return;
-    };
-    if status != 0 {
-        return;
-    }
-    if let Some(frame) = unsafe { annex_b(sample) } {
-        slot.push(frame);
-    }
-}
-
-/// VideoToolbox writes length-prefixed NAL units with the parameter sets kept
-/// aside; a decoder reading a plain byte stream wants start codes, and the
-/// parameter sets in front of every keyframe.
-unsafe fn annex_b(sample: &CMSampleBuffer) -> Option<Frame> {
-    let block = unsafe { sample.data_buffer() }?;
-    let len = unsafe { block.data_length() };
-    let mut body = vec![0u8; len];
-    if unsafe { block.copy_data_bytes(0, len, NonNull::new(body.as_mut_ptr().cast())?) } != 0 {
-        return None;
-    }
-    let key = unsafe { is_keyframe(sample) };
-    let mut params: Vec<&[u8]> = Vec::new();
-    let mut prefix = 4;
-    if key {
-        let format = unsafe { sample.format_description() }?;
-        let mut count = 0usize;
-        let mut index = 0usize;
-        loop {
-            let (mut ptr, mut size, mut header) = (std::ptr::null(), 0usize, 0i32);
-            let got = unsafe {
-                CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(
-                    &format, index, &mut ptr, &mut size, &mut count, &mut header,
-                )
-            };
-            if got != 0 || ptr.is_null() {
-                break;
-            }
-            prefix = header as usize;
-            // SAFETY: owned by the format description, which lives until this
-            // frame has been rewritten below.
-            params.push(unsafe { std::slice::from_raw_parts(ptr, size) });
-            index += 1;
-            if index >= count {
-                break;
-            }
-        }
-    }
-    Some(Frame { key, data: to_annex_b(&body, prefix, &params)? })
-}
-
-/// Keyframes are the samples *not* marked "not sync".
-unsafe fn is_keyframe(sample: &CMSampleBuffer) -> bool {
-    let Some(attachments) = (unsafe { sample.sample_attachments_array(false) }) else { return true };
-    // SAFETY: CFArray of CFDictionary is toll-free bridged to NSArray of NSDictionary.
-    let attachments: &NSArray<NSDictionary<NSString, AnyObject>> =
-        unsafe { &*(CFRetained::as_ptr(&attachments).as_ptr() as *const _) };
-    let not_sync: &NSString = unsafe { &*(kCMSampleAttachmentKey_NotSync as *const CFString as *const NSString) };
-    attachments
-        .firstObject()
-        .and_then(|dict| dict.objectForKey(not_sync))
-        .and_then(|value| value.downcast::<NSNumber>().ok())
-        .is_none_or(|value| !value.boolValue())
-}
-
-const START: [u8; 4] = [0, 0, 0, 1];
-
-/// Rewrite `prefix`-byte length-prefixed NAL units as start-code delimited
-/// ones, parameter sets first. `None` if a length runs past the end.
-fn to_annex_b(body: &[u8], prefix: usize, params: &[&[u8]]) -> Option<Vec<u8>> {
-    if !(1..=4).contains(&prefix) {
-        return None;
-    }
-    let mut out = Vec::with_capacity(body.len() + params.iter().map(|p| p.len() + 4).sum::<usize>());
-    for param in params {
-        out.extend_from_slice(&START);
-        out.extend_from_slice(param);
-    }
-    let mut at = 0;
-    while at < body.len() {
-        let len = body.get(at..at + prefix)?.iter().fold(0usize, |n, &b| n << 8 | b as usize);
-        at += prefix;
-        out.extend_from_slice(&START);
-        out.extend_from_slice(body.get(at..at + len)?);
-        at += len;
-    }
-    Some(out)
 }
 
 pub struct Sink {
@@ -647,101 +296,7 @@ unsafe fn frame_status(sample: &CMSampleBuffer) -> Option<SCFrameStatus> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn length_prefixes_become_start_codes() {
-        let body = [0, 0, 0, 2, 0xAA, 0xBB, 0, 0, 0, 1, 0xCC];
-        let out = to_annex_b(&body, 4, &[&[0x40, 1], &[0x42]]).unwrap();
-        assert_eq!(
-            out,
-            [0, 0, 0, 1, 0x40, 1, 0, 0, 0, 1, 0x42, 0, 0, 0, 1, 0xAA, 0xBB, 0, 0, 0, 1, 0xCC]
-        );
-    }
-
-    #[test]
-    fn a_truncated_frame_is_refused() {
-        assert_eq!(to_annex_b(&[0, 0, 0, 9, 1], 4, &[]), None);
-        assert_eq!(to_annex_b(&[0, 0], 4, &[]), None);
-        assert_eq!(to_annex_b(&[1], 0, &[]), None);
-    }
-
-    #[test]
-    fn the_virtual_display_sits_centred_on_the_chosen_edge() {
-        // Display 1 from the Arrange window: 2560×1080 at the origin.
-        let d1 = Screen { name: "Display 1".into(), x: 0, y: 0, w: 2560, h: 1080 };
-        assert_eq!(beside(&d1, 1920, 1080, Side::Top), (320, -1080));
-        assert_eq!(beside(&d1, 1920, 1080, Side::Bottom), (320, 1080));
-        assert_eq!(beside(&d1, 1920, 1080, Side::Left), (-1920, 0));
-        assert_eq!(beside(&d1, 1920, 1080, Side::Right), (2560, 0));
-    }
-
-    #[test]
-    fn no_display_named_means_the_whole_desktop() {
-        let screens = [
-            Screen { name: "a".into(), x: -1920, y: 0, w: 1920, h: 1080 },
-            Screen { name: "b".into(), x: 0, y: -200, w: 2560, h: 1440 },
-        ];
-        let all = union(&screens).unwrap();
-        assert_eq!((all.x, all.y, all.w, all.h), (-1920, -200, 4480, 1440));
-        assert!(union(&[]).is_none());
-    }
-
-    #[test]
-    fn hidpi_offers_retina_steps_with_the_monitor_size_first() {
-        let fhd = ScreenMode { w: 1920, h: 1080, hz: 60 };
-        assert_eq!(modes(fhd, true), [(3840, 2160), (3200, 1800), (2560, 1440), (1920, 1080)]);
-        assert_eq!(modes(fhd, false), [(1920, 1080)]);
-        let odd = ScreenMode { w: 1366, h: 768, hz: 60 };
-        assert!(modes(odd, true).iter().all(|(w, h)| w % 2 == 0 && h % 2 == 0), "{:?}", modes(odd, true));
-    }
-
-    #[test]
-    fn short_length_prefixes_work_too() {
-        assert_eq!(to_annex_b(&[0, 1, 7], 2, &[]).unwrap(), [0, 0, 0, 1, 7]);
-    }
-
-    /// The private API is the part most likely to break with a macOS update:
-    /// creating a display must add one to the system, and dropping it must
-    /// take it away again. Needs no permission, but does change the screen
-    /// layout for a moment, so it only runs when asked.
-    #[test]
-    #[ignore]
-    fn a_virtual_display_comes_and_goes() {
-        #[link(name = "CoreGraphics", kind = "framework")]
-        unsafe extern "C" {
-            fn CGDisplayIsActive(display: u32) -> bool;
-            fn CGDisplayBounds(display: u32) -> objc2_core_foundation::CGRect;
-        }
-        let before = crate::screens::local();
-        let queue = DispatchQueue::new("dev.glide.test", DispatchQueueAttr::SERIAL);
-        let (display, id) = virtual_display(ScreenMode { w: 1920, h: 1080, hz: 60 }, true, &queue).unwrap();
-        std::thread::sleep(Duration::from_secs(1));
-        assert!(unsafe { CGDisplayIsActive(id) }, "the display never came up");
-        let points = unsafe { CGDisplayBounds(id) }.size;
-        assert_eq!((points.width, points.height), (1920.0, 1080.0));
-        unsafe { use_hidpi(id, ScreenMode { w: 1920, h: 1080, hz: 60 }) }.expect("switch to HiDPI");
-        std::thread::sleep(Duration::from_millis(500));
-        let points = unsafe { CGDisplayBounds(id) }.size;
-        assert_eq!((points.width, points.height), (1920.0, 1080.0), "HiDPI still looks like the monitor's size");
-        assert_eq!(crate::screens::local(), before, "glide's own display must not count as a real one");
-        drop(display);
-        let dropped = std::time::Instant::now();
-        let listed = || {
-            #[link(name = "CoreGraphics", kind = "framework")]
-            unsafe extern "C" {
-                fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
-            }
-            let (mut ids, mut n) = ([0u32; 16], 0u32);
-            unsafe { CGGetActiveDisplayList(16, ids.as_mut_ptr(), &mut n) };
-            ids[..n as usize].contains(&id)
-        };
-        eprintln!("right after drop: active={} listed={}", unsafe { CGDisplayIsActive(id) }, listed());
-        while listed() && dropped.elapsed() < Duration::from_secs(10) {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        eprintln!("gone after {:?}", dropped.elapsed());
-        assert!(!listed(), "the display must go away when dropped");
-    }
+    use super::hevc::START;
 
     /// The real thing, end to end on this Mac: a virtual display appears,
     /// ScreenCaptureKit captures it, and the first frame out of the encoder
