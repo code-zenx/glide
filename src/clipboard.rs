@@ -19,10 +19,9 @@ const MAX_TEXT: usize = 1 << 20;
 pub const MAX_IMAGE: usize = 16 << 20;
 /// The image types worth carrying, in the order they are asked for.
 const IMAGE_TYPES: [&str; 3] = ["image/png", "image/jpeg", "image/gif"];
-/// ponytail: polling, because neither platform gives a portable change
-/// notification. A second is under human reaction time and costs one clipboard
-/// read; macOS could use NSPasteboard's changeCount if this ever shows up in a
-/// profile.
+/// The watcher looks once a second, but reads only when the clipboard may
+/// have changed (`Changes`): a screenshot left on the clipboard is not copied
+/// and hashed again every second.
 const POLL: Duration = Duration::from_secs(1);
 
 /// What sat on the clipboard last, whether we read it locally or wrote it from
@@ -82,10 +81,14 @@ pub async fn write(clip: Clip) {
 
 /// Send every local copy to the peers, for as long as the daemon runs.
 pub async fn watch(links: Arc<Links>) {
+    let mut changes = Changes::new();
     // Whatever is on the clipboard at startup was not copied just now.
     *LAST_SEEN.lock().unwrap() = read().await.map(|clip| clip.fingerprint());
     loop {
         tokio::time::sleep(POLL).await;
+        if !changes.take() {
+            continue;
+        }
         let Some(clip) = read().await else { continue };
         let now = clip.fingerprint();
         let changed = {
@@ -102,6 +105,43 @@ pub async fn watch(links: Arc<Links>) {
                 links.send(&peer.name, Msg::Clipboard(clip.clone()));
             }
         }
+    }
+}
+
+/// Whether the clipboard may have changed since last asked. macOS counts every
+/// change; Wayland announces each new copy. X11, or a compositor without
+/// data-control, has no signal, so there it is always yes.
+struct Changes {
+    #[cfg(target_os = "macos")]
+    count: isize,
+    #[cfg(not(target_os = "macos"))]
+    flag: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl Changes {
+    #[cfg(target_os = "macos")]
+    fn new() -> Self {
+        Self { count: objc2_app_kit::NSPasteboard::generalPasteboard().changeCount() }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn take(&mut self) -> bool {
+        let count = objc2_app_kit::NSPasteboard::generalPasteboard().changeCount();
+        std::mem::replace(&mut self.count, count) != count
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn new() -> Self {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watching = !x11() && crate::clipboard_wayland::watch(flag.clone())
+            .inspect_err(|e| debug!("no clipboard change events, reading every second: {e:#}"))
+            .is_ok();
+        Self { flag: watching.then_some(flag) }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn take(&mut self) -> bool {
+        self.flag.as_ref().is_none_or(|flag| flag.swap(false, std::sync::atomic::Ordering::Relaxed))
     }
 }
 

@@ -3,6 +3,8 @@ mod audio_mac;
 #[cfg(not(target_os = "macos"))]
 mod capture_wayland;
 mod clipboard;
+#[cfg(not(target_os = "macos"))]
+mod clipboard_wayland;
 mod ctl;
 mod display;
 #[cfg(not(target_os = "macos"))]
