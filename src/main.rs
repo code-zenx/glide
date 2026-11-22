@@ -94,6 +94,7 @@ fn daemon(
         tokio::spawn(view::watch(net.clone(), links.clone(), control_tx.clone(), view_events));
         #[cfg(not(target_os = "macos"))]
         tokio::spawn(view::share(links.clone(), view_events));
+        tokio::spawn(link::leave_on_stop(net.endpoint.clone()));
         let network = tokio::spawn(link::run(
             config.clone(),
             config_path.clone(),
@@ -108,7 +109,6 @@ fn daemon(
         tokio::select! {
             result = input::session(config, config_path, links, status, from_links, link_state, control, to_display, to_view) => result,
             result = network => result?,
-            _ = tokio::signal::ctrl_c() => Ok(()),
         }
     })
 }

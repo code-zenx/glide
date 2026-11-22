@@ -119,11 +119,13 @@ impl Links {
     /// Claim the link to this peer. Both machines dial each other, so two
     /// links can come up at once; the one the server dialed wins on both ends.
     /// Were each end to keep its own, each would hang up the other's and both
-    /// would die. False when this link lost and must hang up.
+    /// would die. Any other new link replaces the held one: neither end dials
+    /// a peer it is linked to, so the held one is a dead machine's leftover
+    /// waiting out its idle timeout. False when this link lost and must hang up.
     pub(super) fn try_register(&self, peer: &str, tx: UnboundedSender<Msg>, by_server: bool) -> bool {
         let mut peers = self.peers.lock().unwrap();
         let held = peers.get(peer).filter(|live| !live.tx.is_closed());
-        if held.is_some_and(|live| live.by_server || !by_server) {
+        if held.is_some_and(|live| live.by_server && !by_server) {
             return false;
         }
         peers.insert(peer.to_string(), Live { tx, by_server });
@@ -164,7 +166,7 @@ mod tests {
         links.send("mybox", Msg::Enter);
         assert_eq!(rx.try_recv().unwrap(), Msg::Enter);
         let (second, _second_rx) = unbounded_channel();
-        assert!(!links.try_register("mybox", second, true), "a second link must be refused");
+        assert!(!links.try_register("mybox", second, false), "a client's dial never displaces the server's link");
         assert!(links.unregister("mybox", &tx));
         links.send("mybox", Msg::Leave);
         assert!(rx.try_recv().is_err());
@@ -183,5 +185,24 @@ mod tests {
         links.send("mac", Msg::Enter);
         assert_eq!(servers_rx.try_recv().unwrap(), Msg::Enter);
         assert!(links.unregister("mac", &servers));
+    }
+
+    /// Neither end dials a peer it is linked to, so a second link of the same
+    /// kind means the first is dead: its machine restarted, and the old link
+    /// lingers until the idle timeout. The new one must not wait for that.
+    #[test]
+    fn a_restarted_peer_replaces_its_dead_link() {
+        let links = Links::default();
+        let (old_server, _old_rx) = unbounded_channel();
+        assert!(links.try_register("mac", old_server, true));
+        let (new_server, mut new_rx) = unbounded_channel();
+        assert!(links.try_register("mac", new_server, true), "the restarted server's dial");
+        links.send("mac", Msg::Enter);
+        assert_eq!(new_rx.try_recv().unwrap(), Msg::Enter);
+
+        let (old_client, _old_rx) = unbounded_channel();
+        assert!(links.try_register("anorak", old_client, false));
+        let (new_client, _new_rx) = unbounded_channel();
+        assert!(links.try_register("anorak", new_client, false), "the restarted client's dial");
     }
 }

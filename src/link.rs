@@ -155,6 +155,31 @@ pub async fn run(
     Ok(())
 }
 
+/// On Ctrl+C, or SIGTERM on Linux (systemd stopping or restarting glide),
+/// close every link with a goodbye. Killed silently, this machine would leave
+/// its peers holding a dead link until the 10 s idle timeout. Closing the
+/// endpoint ends `run`'s accept loop, so `run` returns once the goodbyes are
+/// out, and the daemon with it.
+pub async fn leave_on_stop(endpoint: Endpoint) {
+    stopped().await;
+    info!("stopping: closing every link");
+    endpoint.close(0u32.into(), b"stopping");
+}
+
+/// The Mac app keeps SIGTERM's default: caught, it would leave the menu bar
+/// running with no daemon behind it.
+async fn stopped() {
+    #[cfg(not(target_os = "macos"))]
+    if let Ok(mut term) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+        return;
+    }
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 fn alpn(conn: &Connection) -> Option<Vec<u8>> {
     conn.handshake_data()
         .and_then(|data| data.downcast::<quinn::crypto::rustls::HandshakeData>().ok())
