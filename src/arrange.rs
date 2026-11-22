@@ -27,6 +27,9 @@ use crate::input::Control;
 use crate::screens::Screen;
 use crate::Side;
 
+/// One screen as drawn: where it sits, and the label written on it.
+type Labeled = (NSRect, String);
+
 /// Empty space around the drawing, in points. A machine's name pill sits in
 /// this margin, above or below its screens.
 const PADDING: f64 = 40.0;
@@ -184,9 +187,9 @@ impl ArrangeView {
     /// Every machine in one coordinate space: this Mac where the system puts
     /// it, each peer parked off its chosen edge. No drag applied — dragging
     /// moves the drawing, not the layout, so the scale never jitters.
-    fn boxes(&self) -> (Vec<(NSRect, String)>, Vec<Vec<(NSRect, String)>>) {
+    fn boxes(&self) -> (Vec<Labeled>, Vec<Vec<Labeled>>) {
         let state = self.ivars();
-        let local: Vec<(NSRect, String)> =
+        let local: Vec<Labeled> =
             state.local.iter().map(|s| (rect_of(s), describe(s))).collect();
         let peers = state.peers.iter().map(|peer| park(&local, peer)).collect();
         (local, peers)
@@ -222,7 +225,7 @@ impl ArrangeView {
 
         let canvas = self.canvas();
         let (local, peers) = self.boxes();
-        let all: Vec<(NSRect, String)> = local.iter().chain(peers.iter().flatten()).cloned().collect();
+        let all: Vec<Labeled> = local.iter().chain(peers.iter().flatten()).cloned().collect();
         let Some(world) = union(&all) else { return };
 
         let scale = ((canvas.size.width - PADDING * 2.0) / world.size.width)
@@ -241,9 +244,9 @@ impl ArrangeView {
 
         let state = self.ivars();
         let (moved, dragging) = (state.drag.get(), state.dragging.get());
-        let local_view: Vec<(NSRect, String)> =
+        let local_view: Vec<Labeled> =
             local.iter().map(|(r, l)| (place(*r), l.clone())).collect();
-        let peer_views: Vec<Vec<(NSRect, String)>> = peers
+        let peer_views: Vec<Vec<Labeled>> = peers
             .iter()
             .enumerate()
             .map(|(i, group)| {
@@ -459,7 +462,7 @@ fn text_style(points: f64, colour: Retained<NSColor>) -> Retained<NSDictionary<N
 /// A peer's screens moved to rest against the edge it sits on: the display it
 /// belongs to, or the whole desktop. A peer that has not said what it has
 /// gets one stand-in screen.
-fn park(local: &[(NSRect, String)], peer: &PeerView) -> Vec<(NSRect, String)> {
+fn park(local: &[Labeled], peer: &PeerView) -> Vec<Labeled> {
     let bounds = peer
         .display
         .get()
@@ -467,7 +470,7 @@ fn park(local: &[(NSRect, String)], peer: &PeerView) -> Vec<(NSRect, String)> {
         .map(|(r, _)| *r)
         .or_else(|| union(local))
         .unwrap_or(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1440.0, 900.0)));
-    let screens: Vec<(NSRect, String)> = if peer.screens.is_empty() {
+    let screens: Vec<Labeled> = if peer.screens.is_empty() {
         vec![(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1920.0, 1080.0)), "screen".to_string())]
     } else {
         peer.screens.iter().map(|s| (rect_of(s), describe(s))).collect()
@@ -546,7 +549,7 @@ fn centre_on(mine: f64, mine_len: f64, theirs: f64, theirs_len: f64) -> f64 {
     mine + (mine_len - theirs_len) / 2.0 - theirs
 }
 
-fn union(boxes: &[(NSRect, String)]) -> Option<NSRect> {
+fn union(boxes: &[Labeled]) -> Option<NSRect> {
     let mut it = boxes.iter().map(|(r, _)| *r);
     let first = it.next()?;
     let (mut x0, mut y0) = (first.origin.x, first.origin.y);
