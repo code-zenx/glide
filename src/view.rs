@@ -6,9 +6,10 @@
 //! mode of the screen it will send. The Mac then dials a connection of its
 //! own (ALPN `glide-view/0`, see `link.rs`), and the peer opens two streams
 //! back on it: video, framed exactly like an extended display's
-//! (`display::send_frames`), and sound, as `[u32 len][PCM]` chunks. Each
-//! stream starts with one byte saying which it is, so neither end depends on
-//! the order the other opened them in.
+//! (`display::send_frames`), and sound, as `[u32 len][packet]` frames of Opus,
+//! or of raw PCM where the peer has no Opus encoder. Each stream starts with
+//! one byte saying which it is, so neither end depends on the order the other
+//! opened them in, and the Mac knows how to decode the sound.
 //!
 //! The window's own input is `view_input_mac.rs`'s business. The session
 //! (`input.rs`) decides when a view starts and ends: from the menu, `glide ctl`,
@@ -26,7 +27,10 @@ use crate::link::Links;
 use crate::proto::Msg;
 
 const VIDEO: u8 = b'v';
+/// Sound as raw 16-bit stereo PCM at 48 kHz.
 const SOUND: u8 = b'a';
+/// Sound as Opus, one packet per frame.
+const OPUS: u8 = b'o';
 
 /// Everything the view side hears about, from the session and the network.
 pub enum Event {
@@ -62,9 +66,10 @@ async fn open_stream(conn: &Connection, kind: u8) -> Result<SendStream> {
     Ok(send)
 }
 
-/// The Mac's end: the peer's two streams, as (video, sound).
+/// The Mac's end: the peer's two streams, as (video, (sound, whether the
+/// sound is Opus rather than PCM)).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-pub(crate) async fn accept_streams(conn: &Connection) -> Result<(RecvStream, RecvStream)> {
+pub(crate) async fn accept_streams(conn: &Connection) -> Result<(RecvStream, (RecvStream, bool))> {
     let (mut video, mut sound) = (None, None);
     while video.is_none() || sound.is_none() {
         let mut recv = conn.accept_uni().await?;
@@ -72,7 +77,8 @@ pub(crate) async fn accept_streams(conn: &Connection) -> Result<(RecvStream, Rec
         recv.read_exact(&mut kind).await?;
         match kind[0] {
             VIDEO => video = Some(recv),
-            SOUND => sound = Some(recv),
+            SOUND => sound = Some((recv, false)),
+            OPUS => sound = Some((recv, true)),
             other => bail!("unknown view stream {other}"),
         }
     }
@@ -287,9 +293,10 @@ fn start(screen: &crate::view_linux::Screen, conn: Connection) -> Result<Sharing
     let sound = Sound::start(chunks)
         .inspect_err(|e| warn!("sharing the screen without sound: {e:#}"))
         .ok();
+    let tag = if sound.as_ref().is_some_and(|s| s.opus) { OPUS } else { SOUND };
     let tasks = [
         tokio::spawn(send_video(conn.clone(), slot)),
-        tokio::spawn(send_sound(conn, queued)),
+        tokio::spawn(send_sound(conn, queued, tag)),
     ];
     Ok(Sharing {
         tasks,
@@ -311,9 +318,9 @@ async fn send_video(conn: Connection, slot: Arc<crate::display::Slot>) {
 }
 
 #[cfg(not(target_os = "macos"))]
-async fn send_sound(conn: Connection, mut queued: tokio::sync::mpsc::Receiver<Vec<u8>>) {
+async fn send_sound(conn: Connection, mut queued: tokio::sync::mpsc::Receiver<Vec<u8>>, tag: u8) {
     let sent: Result<()> = async {
-        let mut send = open_stream(&conn, SOUND).await?;
+        let mut send = open_stream(&conn, tag).await?;
         // Sound is tiny next to video: it goes first whenever both wait.
         send.set_priority(1)?;
         while let Some(chunk) = queued.recv().await {
@@ -402,10 +409,19 @@ mod tests {
 
     /// Two real endpoints over loopback: the view connection must be told
     /// apart from the others, and its two streams apart by their tags, not
-    /// by the order they were opened in.
+    /// by the order they were opened in; the sound's tag says how to decode it.
     #[tokio::test(flavor = "multi_thread")]
     async fn screen_and_sound_cross_a_view_connection_apart() -> Result<()> {
-        let dir = std::env::temp_dir().join(format!("glide-view-{}", std::process::id()));
+        for (tag, opus) in [(SOUND, false), (OPUS, true)] {
+            assert_eq!(cross_view_connection(tag).await?, opus, "sound tag {tag}");
+        }
+        Ok(())
+    }
+
+    /// Whether the Mac took the sound for Opus.
+    async fn cross_view_connection(sound_tag: u8) -> Result<bool> {
+        let name = format!("glide-view-{}-{sound_tag}", std::process::id());
+        let dir = std::env::temp_dir().join(name);
         let (linux, mac, peer) = crate::link::loopback(&dir)?;
         let (accepted, dialed) = tokio::join!(
             async { linux.endpoint.accept().await.unwrap().await.unwrap() },
@@ -431,7 +447,7 @@ mod tests {
             })
             .collect();
         let sending = tokio::spawn(async move {
-            let mut sound = open_stream(&accepted, SOUND).await.unwrap();
+            let mut sound = open_stream(&accepted, sound_tag).await.unwrap();
             let mut video = open_stream(&accepted, VIDEO).await.unwrap();
             crate::link::write_frame(&mut sound, &[1, 2, 3, 4])
                 .await
@@ -444,7 +460,7 @@ mod tests {
             let (_, _) = (sound.finish(), video.finish());
             accepted.closed().await;
         });
-        let (mut video, mut sound) = accept_streams(&dialed).await?;
+        let (mut video, (mut sound, opus)) = accept_streams(&dialed).await?;
         assert_eq!(crate::link::read_frame(&mut sound).await?, [1, 2, 3, 4]);
         let mut got = Vec::new();
         let ended = crate::display::recv_frames(&mut video, |frame| got.push(frame)).await;
@@ -453,6 +469,6 @@ mod tests {
         dialed.close(0u32.into(), b"done");
         sending.await?;
         let _ = std::fs::remove_dir_all(&dir);
-        Ok(())
+        Ok(opus)
     }
 }

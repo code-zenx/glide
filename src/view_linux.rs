@@ -1,5 +1,6 @@
 //! The sending end of View Screen on Linux: this machine's screen as H.264
-//! and its sound as PCM, for the Mac to show fullscreen.
+//! and its sound as Opus (raw PCM without `opusenc`), for the Mac to show
+//! fullscreen.
 //!
 //! - **Hyprland**: frames come from wlr-screencopy (`capture_wayland.rs`). A
 //!   box with no screen plugged in gets a headless monitor for as long as the
@@ -8,10 +9,9 @@
 //!
 //! H.264, not HEVC: VA-API HEVC encoding crashed Sunshine on anorak's UHD 630.
 //! Sound is captured the way Sunshine does it: a null sink becomes the default
-//! output, and its monitor is recorded.
-//!
-//! ponytail: sound is raw PCM (about 1.5 Mbit/s, nothing next to the video on
-//! a LAN, and no codec on the Mac). Opus is the upgrade if Wi-Fi ever minds.
+//! output, and its monitor is recorded. Opus takes it from about 1.5 Mbit/s
+//! of PCM to 128 kbit/s, which matters over Tailscale; PCM stays as the
+//! fallback because `opusenc` comes with gst-plugins-base, not always there.
 
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
@@ -43,6 +43,14 @@ const TAIL: &str =
     "h264parse config-interval=-1 ! video/x-h264,stream-format=byte-stream,alignment=au \
                     ! appsink name=sink sync=false";
 const PCM: &str = "audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved";
+/// 10 ms packets, CELT only (`restricted-lowdelay` drops the speech modes'
+/// look-ahead): the least delay `opusenc` has, at a bitrate where music
+/// sounds like the PCM it replaces.
+const OPUS_TUNING: [(&str, &str); 3] = [
+    ("bitrate", "128000"),
+    ("frame-size", "10"),
+    ("audio-type", "restricted-lowdelay"),
+];
 
 /// Whether this machine can be viewed: Hyprland always, X11 with `ximagesrc`.
 /// Asked once: it does not change while the daemon runs.
@@ -271,17 +279,29 @@ pub struct Sound {
     pipeline: gst::Pipeline,
     module: String,
     previous: Option<String>,
+    /// Whether `chunks` gets Opus packets rather than PCM.
+    pub opus: bool,
 }
 
 impl Sound {
-    /// `chunks` gets about 10 ms of PCM at a time; when it is full, the chunk
-    /// is dropped rather than waited for.
+    /// `chunks` gets one 10 ms Opus packet at a time, or about 10 ms of PCM
+    /// without `opusenc`; when it is full, the chunk is dropped rather than
+    /// waited for.
     pub fn start(chunks: tokio::sync::mpsc::Sender<Vec<u8>>) -> Result<Self> {
         gst::init()?;
         let source = format!("pulsesrc device={SINK}.monitor buffer-time=20000 latency-time=10000");
+        let opus = gst::ElementFactory::find("opusenc").is_some();
+        let encode = if opus { " ! opusenc name=opus" } else { "" };
         let pipeline = launch(&format!(
-            "{source} ! audioconvert ! audioresample ! {PCM} ! appsink name=sink sync=false"
+            "{source} ! audioconvert ! audioresample ! {PCM}{encode} ! appsink name=sink sync=false"
         ))?;
+        if let Some(enc) = pipeline.by_name("opus") {
+            for (name, value) in OPUS_TUNING {
+                if enc.find_property(name).is_some() {
+                    enc.set_property_from_str(name, value);
+                }
+            }
+        }
         appsink(&pipeline)?.set_callbacks(chunks_into(chunks));
         // A crash mid-view leaves the null sink the default; never go back to it.
         let previous = pactl(&["get-default-sink"])
@@ -297,6 +317,7 @@ impl Sound {
             pipeline,
             module,
             previous,
+            opus,
         };
         pactl(&["set-default-sink", SINK])?;
         sound.pipeline.set_state(gst::State::Playing)?;
@@ -321,13 +342,18 @@ fn chunks_into(chunks: tokio::sync::mpsc::Sender<Vec<u8>>) -> gst_app::AppSinkCa
         .new_sample(move |sink| {
             let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
             let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
-            let pcm = buffer
+            // opusenc's OpusHead and OpusTags: the Mac's decoder is set up by
+            // the stream's tag instead, and would only fail on them.
+            if buffer.flags().contains(gst::BufferFlags::HEADER) {
+                return Ok(gst::FlowSuccess::Ok);
+            }
+            let chunk = buffer
                 .map_readable()
                 .map_err(|_| gst::FlowError::Error)?
                 .as_slice()
                 .to_vec();
             // Full: the network is behind. A click now beats a delay forever.
-            let _ = chunks.try_send(pcm);
+            let _ = chunks.try_send(chunk);
             Ok(gst::FlowSuccess::Ok)
         })
         .build()

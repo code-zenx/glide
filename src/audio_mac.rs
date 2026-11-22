@@ -1,5 +1,6 @@
 //! View Screen's sound on the Mac: 16-bit stereo PCM at 48 kHz, played by an
-//! AudioQueue as it arrives.
+//! AudioQueue as it arrives. A peer that sends Opus has it decoded to that
+//! PCM first (`opus.rs`).
 //!
 //! Latency is bounded by counting buffers, not by timing: a chunk that finds
 //! every buffer still queued is dropped. A click when the network hiccups is
@@ -10,6 +11,8 @@ use std::ptr::null;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Result};
+
+mod opus;
 
 const RATE: f64 = 48_000.0;
 /// At 10–20 ms a chunk, the most sound that can ever be waiting to play.
@@ -84,6 +87,8 @@ unsafe impl Send for Free {}
 
 pub struct Speaker {
     queue: Queue,
+    /// Set when the peer sends Opus rather than raw PCM.
+    opus: Option<opus::Decoder>,
     /// Read by the callback through a raw pointer, so it must outlive the
     /// queue: `Drop` disposes the queue before this goes.
     free: Arc<Mutex<Free>>,
@@ -95,23 +100,13 @@ pub struct Speaker {
 unsafe impl Send for Speaker {}
 
 impl Speaker {
-    pub fn open() -> Result<Self> {
-        let format = StreamFormat {
-            sample_rate: RATE,
-            format_id: LINEAR_PCM,
-            format_flags: SIGNED_PACKED,
-            bytes_per_packet: 4,
-            frames_per_packet: 1,
-            bytes_per_frame: 4,
-            channels_per_frame: 2,
-            bits_per_channel: 16,
-            reserved: 0,
-        };
+    pub fn open(opus: bool) -> Result<Self> {
+        let opus = opus.then(opus::Decoder::open).transpose()?;
         let free = Arc::new(Mutex::new(Free(Vec::with_capacity(BUFFERS))));
         let mut queue: Queue = std::ptr::null_mut();
         let context = Arc::as_ptr(&free) as *mut c_void;
         let status = unsafe {
-            AudioQueueNewOutput(&format, returned, context, null(), null(), 0, &mut queue)
+            AudioQueueNewOutput(&pcm_format(), returned, context, null(), null(), 0, &mut queue)
         };
         if status != 0 {
             bail!("cannot open the sound output (status {status})");
@@ -119,6 +114,7 @@ impl Speaker {
         // Built now, so `Drop` disposes the queue if a buffer cannot be had.
         let speaker = Self {
             queue,
+            opus,
             free,
             started: false,
         };
@@ -133,8 +129,14 @@ impl Speaker {
         Ok(speaker)
     }
 
-    /// Queue one chunk of PCM, or drop it if the queue is full.
-    pub fn play(&mut self, pcm: &[u8]) {
+    /// Queue one chunk of sound, or drop it if the queue is full. Opus is
+    /// decoded even then, so the decoder never misses a packet.
+    pub fn play(&mut self, chunk: &[u8]) {
+        let decoded = match &mut self.opus {
+            Some(decoder) => decoder.decode(chunk),
+            None => Some(chunk),
+        };
+        let Some(pcm) = decoded else { return };
         let Some(buffer) = self.free.lock().unwrap().0.pop() else {
             tracing::debug!("sound is behind, dropped a chunk");
             return;
@@ -154,6 +156,21 @@ impl Speaker {
         if !self.started && queued >= PREROLL {
             self.started = unsafe { AudioQueueStart(self.queue, null()) } == 0;
         }
+    }
+}
+
+/// What the AudioQueue plays, and what Opus is decoded to.
+fn pcm_format() -> StreamFormat {
+    StreamFormat {
+        sample_rate: RATE,
+        format_id: LINEAR_PCM,
+        format_flags: SIGNED_PACKED,
+        bytes_per_packet: 4,
+        frames_per_packet: 1,
+        bytes_per_frame: 4,
+        channels_per_frame: 2,
+        bits_per_channel: 16,
+        reserved: 0,
     }
 }
 

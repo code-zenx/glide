@@ -167,10 +167,10 @@ async fn receive(net: &crate::link::Net, peer: &crate::Peer, device: Device) -> 
     shown
 }
 
-/// The device's sound, for as long as it sends any. Sound that cannot play
-/// is no reason to end the view.
-async fn play(mut recv: RecvStream) {
-    let mut speaker = match crate::audio_mac::Speaker::open() {
+/// The device's sound, Opus or raw PCM, for as long as it sends any. Sound
+/// that cannot play is no reason to end the view.
+async fn play((mut recv, opus): (RecvStream, bool)) {
+    let mut speaker = match crate::audio_mac::Speaker::open(opus) {
         Ok(speaker) => speaker,
         Err(e) => return tracing::warn!("viewing without sound: {e:#}"),
     };
